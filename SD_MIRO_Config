@@ -1,59 +1,862 @@
 Option Explicit
+' Uses: SD_MIRO_Config + your modSAP module
+Public Const DEFAULT_COMPANY_CODE As String = "0252"
+Public Const ALWAYS_PROMPT_COMPANY_CODE As Boolean = True   ' False = use default silently
+Private Const MAX_ENTER_RETRIES As Long = 10
+
+Public Sub SD_Post_MIRO_FromSD()
+    Dim ses As Object
+    Set ses = SapGetSessionByTCode("P10", "", "MIRO", True, True, True)
+    
+    Dbg "---- MIRO posting started ----"
+    Dbg "Initial focus = " & GetGuiFocusId(ses)
+
+    If ses Is Nothing Then
+        MsgBox "SAP session not available (or scripting disabled).", vbCritical
+        Exit Sub
+    End If
+
+    ' 0) Make sure we are on MIRO
+    Call SapEnsureOnTCode(ses, "MIRO", 2#)
+
+    ' 1) Handle company code popup
+    If ALWAYS_PROMPT_COMPANY_CODE Then
+        Call SapHandleCommonPopups(ses)
+    Else
+        Call SapHandleCommonPopups(ses, DEFAULT_COMPANY_CODE)
+    End If
+
+    ' 2) Ensure VORGANG is 3 (Subsequent Debit) ? if already 3, no Enter
+    If SapWaitForId(ses, ID_VORGANG, 2#) Then
+        If Not EnsureVorgangIs3_NoExtraEnter(ses) Then
+            Dbg "After VORGANG, focus = " & GetGuiFocusId(ses)
+            Dbg "BLDAT editable? " & IsEditable(ses, ID_BLDAT)
+            MsgBox "Could not ensure VORGANG=3.", vbCritical
+            Exit Sub
+        End If
+    End If
+
+    ' 3) TOTAL tab should already be the default, but ensure BLDAT exists
+    Call SapSafePress(ses, ID_TAB_HDR_TOTAL)
+    If Not SapWaitForId(ses, ID_BLDAT, 2#) Then
+        MsgBox "TOTAL screen not ready.", vbExclamation
+        Exit Sub
+    End If
+    
+    Debug.Print ses.findById(ID_XBLNR).Type
+
+    ' 4) Read posting rows
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(SD_SHEET)
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.Count, ws.Columns(COL_DATE).Column).End(xlUp).row
+
+    Dim r As Long
+    For r = FIRST_DATA_ROW To lastRow
+        ' === Strict: if row not usable, STOP (no skipping) ===
+        Dim vendor As String, cur As String, po As String
+        Dim dateTxt As String, refTxt As String, basicTxt As String
+        Dim taxAmt As Variant, totalAmt As Variant, taxKey As String
+        Dim openedId As String, typ1 As String, msg1 As String
+        Dim stepHint As String, headerTxt As String, assignment As String
+        Dim i As Long
+                
+    
+        vendor = Trim$(CStr(Rd(ws, COL_VENDOR_CODE, r)))
+        cur = Trim$(CStr(Rd(ws, COL_CURRENCY, r)))
+        po = Trim$(CStr(Rd(ws, COL_PO, r)))
+        dateTxt = CleanDateText(Rd(ws, COL_DATE, r))
+        refTxt = Trim$(CStr(Rd(ws, COL_REFERENCE, r)))
+        basicTxt = Trim$(CStr(Rd(ws, COL_TEXT, r)))
+        taxAmt = Rd(ws, COL_TAXAMT, r)
+        totalAmt = Rd(ws, COL_TOTAL_AMOUNT, r)
+        headerTxt = Trim$(CStr(Rd(ws, COL_HEADER_TEXT, r)))
+   
+
+        If Len(vendor) = 0 Or Len(cur) = 0 Or Len(po) = 0 _
+           Or Len(dateTxt) = 0 Or Len(NzStr(totalAmt)) = 0 Then
+            MsgBox "Row " & r & ": required field blank. Stopping (no skip).", vbCritical
+            Exit Sub
+        End If
+
+        ' ===== A) DATES: type both ¡æ press Enter until hard errors clear ¡æ force focus to XBLNR =====
+        Dbg "Setting date fields for row " & r & "..."
+        Call SetTextWithDiag(ses, ID_BLDAT, dateTxt, False)
+        Call SetTextWithDiag(ses, ID_BUDAT, dateTxt, False)
+        
+        Dbg "Committing dates (advancing to Reference)..."
+       ' New (fast):
+        If Not P10_SD_AdvanceFromDatesToRef(ses, ID_XBLNR) Then
+            MsgBox "Could not move to Reference field.", vbExclamation
+            Exit Sub
+        End If
+        Dbg "After committing dates, focus = " & GetGuiFocusId(ses)
+        
+        ' ===== B) REFERENCE: single atomic helper (exactly like the test) =====
+        If Len(refTxt) = 0 Then
+            MsgBox "Row " & r & ": Reference (col F) is empty.", vbExclamation
+            Exit Sub
+        End If
+        
+        Dbg "Setting Reference via helper '" & refTxt & "'..."
+        If Not SapPressEnterUntilEditableThenSet(ses, ID_XBLNR, NormalizeRef16(refTxt), 8) Then
+            Dim typ_ As String, msg_ As String
+            SD_GetStatusBar ses, typ_, msg_
+            MsgBox "Row " & r & ": Reference failed to set. [" & typ_ & "] " & msg_, vbExclamation
+            Exit Sub
+        End If
+        
+        SapWaitIdle ses, 0.3
+        Dbg "After Reference, focus = " & GetGuiFocusId(ses)
+
+
+        ' ===== C) TOTALS first (no Enter), THEN select Tax Code (may refresh) =====
+         If Not SD_SetTotals_ThenTax(ses, totalAmt, taxAmt, cur, basicTxt) Then
+            MsgBox "Row " & r & ": Totals/Tax failed (popup or control not ready).", vbExclamation
+            Exit Sub
+        End If
+
+ 
+        ' --- Items ¡æ PO tab ---
+        ' Ensure we are on Items ? PO tab
+        SapTryDismissPopup ses
+        SapWaitIdle ses, 0.2
+        If Not SapSafeSelect(ses, ID_TAB_ITEMS_PO, 5) Then GoTo FatalStop
+        
+        ' Enter one or many POs
+        If Not EnterPONumbers(ses, po) Then GoTo FatalStop
+        
+        ' Optionally press Select All
+        If SapExistsId(ses, ID_ITEM_SELECT_ALL) Then Call SapSafePress(ses, ID_ITEM_SELECT_ALL, 3)
+
+        
+        ' Try selecting the PO tab again safely (after PO entry)
+        stepHint = "Select PO tab (ID_TAB_ITEMS_PO)"
+     
+        
+     ' --- FI (Detail) tab ---
+         stepHint = "FI (ID_TAB_HDR_FI)"
+        For i = 1 To 3
+            ' clear any modal first
+            SapTryDismissPopup ses
+        
+            ' select the tab (tabs need .Select, not .press)
+            If SapSafeSelect(ses, ID_TAB_HDR_FI, 5) Then
+                SapWaitIdle ses, 0.4
+        
+                ' some systems pop a dialog *after* the tab switch
+                SapTryDismissPopup ses
+                SapWaitIdle ses, 0.2
+        
+                ' verify we are truly on FI (Vendor anchor present/usable)
+                If SapWaitForId(ses, ID_VENDOR, 3#) Then
+                    Exit For
+                End If
+            End If
+        
+            SapWaitIdle ses, 0.5
+        Next i
+        
+        If i > 3 Then GoTo FatalStop
+        
+        ' Immediately copy DIFF ? UNPL on FI tab (with popup handling)
+        If Not SD_CopyDiffCostToUnpl(ses) Then
+            Dbg "Warn: could not copy ID_DIFF_COST ? ID_UNPL_DEL_COST"
+        End If
+        
+        stepHint = "FI (ID_VENDOR)"
+        If Not SapWaitForId(ses, ID_VENDOR, 5#) Then
+            MsgBox "FI tab not ready (Vendor field missing).", vbExclamation
+            GoTo FatalStop
+        End If
+        
+        ' Set Vendor/Text on FI
+        If Not SD_SetVendorAndText_NoMove(ses, vendor, headerTxt) Then
+            MsgBox "Row " & r & ": Vendor/Text didn¡¯t validate.", vbCritical
+            Exit Sub
+        End If
+        
+        ' ===== F) Post (F11) =====
+        Dbg "Ready to post Row " & r & ". Current focus = " & GetGuiFocusId(ses)
+
+        'ses.findById("wnd[0]").sendVKey 11
+        Call SapWaitIdle(ses, 2#)
+        SapTryDismissPopup ses
+
+        ' next row
+        GoTo NextRow
+
+FatalStop:
+    Dim t As String, m As String
+    SD_GetStatusBar ses, t, m
+    MsgBox "Row " & r & ": validation failure at step [" & stepHint & "]" & vbCrLf & _
+           "Status: [" & t & "] " & m, vbCritical
+    Exit Sub
+
+
+NextRow:
+    Next r
+
+    MsgBox "MIRO completed for rows " & FIRST_DATA_ROW & "?" & lastRow & ".", vbInformation
+    Dbg "---- MIRO run completed ----"
+
+End Sub
+
+'========================
+' Minimal helpers (only what's needed)
+'========================
+
+' Read by column letter like "D" & r
+Private Function Rd(ByVal ws As Worksheet, ByVal colLetter As String, ByVal r As Long) As Variant
+    Rd = ws.Range(colLetter & CStr(r)).value
+End Function
+
+' yyyymmdd formatting from common inputs
+Private Function CleanDateText(ByVal v As Variant) As String
+    Dim d As Date, s As String
+    If IsDate(v) Then
+        d = CDate(v)
+    Else
+        s = Trim$(CStr(v))
+        s = Replace(Replace(s, "/", "-"), ".", "-")
+        If s Like "####-##-##" Then d = DateSerial(Left$(s, 4), Mid$(s, 6, 2), Right$(s, 2))
+        If IsNumeric(s) And Len(s) = 8 Then d = DateSerial(Left$(s, 4), Mid$(s, 5, 2), Right$(s, 2))
+    End If
+    If d <> 0 Then CleanDateText = Format$(d, "yyyymmdd") Else CleanDateText = ""
+End Function
+
+Private Function Nz0(v As Variant) As Double
+    If IsError(v) Or IsEmpty(v) Or Len(Trim$(CStr(v))) = 0 Then Nz0 = 0# Else Nz0 = CDbl(v)
+End Function
+
+Private Function NzStr(v As Variant) As String
+    If IsError(v) Or IsEmpty(v) Then NzStr = "" Else NzStr = Trim$(CStr(v))
+End Function
+
+Private Function SetDatePairAndVerifyMove(ByVal ses As Object, ByVal yyyymmdd As String) As Boolean
+    On Error GoTo EH
+    Dim oBL As Object, oBU As Object
+    Set oBL = ses.findById(ID_BLDAT)
+    Set oBU = ses.findById(ID_BUDAT)
+
+    oBL.SetFocus
+    oBL.Text = vbNullString
+    oBL.Text = yyyymmdd
+    oBU.Text = vbNullString
+    oBU.Text = yyyymmdd
+
+    ' Press Enter until focus becomes ID_XBLNR (Reference)
+    If WaitFocusBecomes(ses, ID_XBLNR, MAX_ENTER_RETRIES) Then
+        SetDatePairAndVerifyMove = True
+        Exit Function
+    End If
+EH:
+    SetDatePairAndVerifyMove = False
+End Function
+
+' Read current focus TechID
+Private Function GetFocusId(ByVal ses As Object) As String
+    On Error Resume Next
+    GetFocusId = CStr(ses.findById("wnd[0]").GuiFocus.id)
+End Function
+
+
+' Ensure VORGANG key = "3" but do NOT press Enter if already 3
+Private Function EnsureVorgangIs3_NoExtraEnter(ByVal ses As Object) As Boolean
+    On Error GoTo EH
+    Dim o As Object: Set o = ses.findById(ID_VORGANG)
+    Dim curKey As String, curTxt As String
+    On Error Resume Next
+    curKey = CStr(o.key): curTxt = CStr(o.Text)
+    On Error GoTo EH
+
+    If (Len(curKey) > 0 And curKey = "3") Or (Len(curKey) = 0 And InStr(1, curTxt, "3") > 0) Then
+        EnsureVorgangIs3_NoExtraEnter = True: Exit Function
+    End If
+
+    If Not SapSafeSetKey(ses, ID_VORGANG, KEY_VORGANG_SD) Then GoTo EH
+    ses.findById("wnd[0]").sendVKey 0
+    Call SapWaitIdle(ses, 1#)
+    EnsureVorgangIs3_NoExtraEnter = True
+    Exit Function
+EH:
+    EnsureVorgangIs3_NoExtraEnter = False
+End Function
+
+' Normalize Reference to common 16-char limit
+Private Function NormalizeRef16(ByVal s As String) As String
+    Dim t As String: t = Trim$(s)
+    If Len(t) > 16 Then t = Left$(t, 16)
+    NormalizeRef16 = t
+End Function
+
+' Amount normalization
+Private Function ToSapAmount(ByVal v As Variant) As String
+    If IsNumeric(v) Then
+        Dim s As String: s = CStr(v)
+        s = Replace(s, Application.ThousandsSeparator, "")
+        s = Replace(s, Application.DecimalSeparator, ".")
+        ToSapAmount = s
+    Else
+        ToSapAmount = ""
+    End If
+End Function
+' Enter single or multiple POs using the exact hard-coded paths you recorded.
+' - Single: writes to ID_ITEM_PO_FIELD, presses Enter.
+' - Multiple: presses the XMSEL button, handles the small OK, fills the MSEL table rows,
+'             then presses Adopt (btn[8]).
+Public Function EnterPONumbers(ByVal s As Object, ByVal poText As String) As Boolean
+    Dim txt As String: txt = Trim$(CStr(poText))
+    Dim parts() As String
+    Dim i As Long
+
+    If Len(txt) = 0 Then Exit Function
+
+    ' ---------- SINGLE PO ----------
+    If InStr(1, txt, "/", vbTextCompare) = 0 Then
+        If Not SapSafeSetText(s, ID_ITEM_PO_FIELD, txt) Then Exit Function
+        s.findById("wnd[0]").sendVKey 0
+        SapWaitIdle s, 0.4
+        SapTryDismissPopup s
+        EnterPONumbers = True
+        Exit Function
+    End If
+
+    ' ---------- MULTIPLE POs ----------
+    parts = Split(txt, "/")
+
+    ' 1) Open the "Multiple" popup (XMSEL)
+    If Not SapSafePress(s, ID_PO_MULTI_BTN, 4) Then Exit Function
+    SapWaitIdle s, 0.2
+
+    ' 2) Some systems show a small OK first on wnd[1] (btn[0]); press if present
+    If SapExistsId(s, "wnd[1]/tbar[0]/btn[0]") Then
+        s.findById("wnd[1]/tbar[0]/btn[0]").press
+        SapWaitIdle s, 0.2
+    End If
+
+    ' 3) Fill EBELN rows in the MSEL table exactly as recorded
+    '    (This is your exact path pattern.)
+    If Not SapWaitForId(s, "wnd[1]/usr/subMSEL:SAPLMR1M:6221/tblSAPLMR1MTC_MSEL_BEST", 5#) Then Exit Function
+
+    For i = 0 To UBound(parts)
+        Dim onePO As String: onePO = Trim$(parts(i))
+        If Len(onePO) = 0 Then GoTo NextRow
+
+        On Error Resume Next
+        s.findById("wnd[1]/usr/subMSEL:SAPLMR1M:6221/tblSAPLMR1MTC_MSEL_BEST/ctxtRM08M-EBELN[0," & i & "]").Text = onePO
+        If Err.Number <> 0 Then
+            Err.Clear
+            ' if row not visible, scroll and write at visible row 0
+            s.findById("wnd[1]/usr/subMSEL:SAPLMR1M:6221/tblSAPLMR1MTC_MSEL_BEST").FirstVisibleRow = i
+            s.findById("wnd[1]/usr/subMSEL:SAPLMR1M:6221/tblSAPLMR1MTC_MSEL_BEST/ctxtRM08M-EBELN[0,0]").Text = onePO
+        End If
+        On Error GoTo 0
+NextRow:
+    Next i
+
+    ' 4) Adopt/OK on the popup (btn[8]) exactly as recorded
+    If Not SapWaitForId(s, "wnd[1]/tbar[0]/btn[8]", 3#) Then Exit Function
+    s.findById("wnd[1]/tbar[0]/btn[8]").press
+
+    SapWaitIdle s, 0.4
+    SapTryDismissPopup s
+    SapWaitIdle s, 0.2
+
+    EnterPONumbers = True
+End Function
+' Press Enter until either:
+'   - The given fields validate successfully (no red error), OR
+'   - The next known field (Reference) becomes enabled for input.
+Private Function PressEnterUntilFocusMoves(ByVal ses As Object, ByVal maxTries As Long, ParamArray techIds() As Variant) As Boolean
+    Dim i As Long, sbar As Object, nextField As Object
+    Dim okStatus As Boolean, nextEnabled As Boolean
+
+    For i = 1 To maxTries
+        ses.findById("wnd[0]").sendVKey 0
+        Call SapWaitIdle(ses, 0.6)
+
+        ' 1) Check SAP status bar (no red error)
+        On Error Resume Next
+        Set sbar = ses.findById("wnd[0]/sbar")
+        okStatus = (sbar.MessageType <> "E" And sbar.MessageType <> "A")
+        On Error GoTo 0
+
+        ' 2) Reference field editable?
+        On Error Resume Next
+        Set nextField = ses.findById(ID_XBLNR)
+        nextEnabled = Not nextField Is Nothing
+        If nextEnabled Then nextEnabled = nextField.Changeable
+        On Error GoTo 0
+
+        If okStatus Or nextEnabled Then
+            PressEnterUntilFocusMoves = True
+            Exit Function
+        End If
+    Next i
+
+    PressEnterUntilFocusMoves = False
+End Function
+
+' True if current focus is NOT on any of the provided techIds
+Private Function FocusMovedOff(ByVal ses As Object, ParamArray techIds() As Variant) As Boolean
+    On Error Resume Next
+    Dim cur As String: cur = CStr(ses.findById("wnd[0]").GuiFocus.id)
+    Dim k As Long
+    For k = LBound(techIds) To UBound(techIds)
+        If StrComp(cur, CStr(techIds(k)), vbTextCompare) = 0 Then
+            FocusMovedOff = False
+            Exit Function
+        End If
+    Next k
+    FocusMovedOff = (Len(cur) > 0)
+End Function
+
+Private Function SapSetTextAndWaitMove(ByVal ses As Object, ByVal techId As String, ByVal val As String) As Boolean
+    On Error GoTo EH
+    Dim o As Object: Set o = ses.findById(techId)
+    o.SetFocus: o.Text = vbNullString: o.Text = val
+
+    If PressEnterUntilFocusMoves(ses, MAX_ENTER_RETRIES, techId) Then
+        SapSetTextAndWaitMove = True
+        Exit Function
+    End If
+EH:
+    SapSetTextAndWaitMove = False
+End Function
+
+Private Function SapSetTextAndWaitOK(ByVal ses As Object, ByVal techId As String, ByVal val As String) As Boolean
+    On Error GoTo EH
+    Dim o As Object: Set o = ses.findById(techId)
+    o.SetFocus
+    o.Text = vbNullString
+    o.Text = val
+
+    Dim i As Long
+    For i = 1 To 2
+        ses.findById("wnd[0]").sendVKey 0
+        Call SapWaitIdle(ses, 2#)
+        If IsStatusBarOk(ses) Then
+            SapSetTextAndWaitOK = True
+            Exit Function
+        End If
+    Next i
+EH:
+    SapSetTextAndWaitOK = False
+End Function
+
+Private Function IsStatusBarOk(ByVal ses As Object) As Boolean
+    On Error Resume Next
+    Dim sbar As Object: Set sbar = ses.findById("wnd[0]/sbar")
+    Dim msgType As String
+    If Not sbar Is Nothing Then msgType = sbar.MessageType
+    IsStatusBarOk = Not (msgType = "E" Or msgType = "A")
+End Function
+
+' Wait until GuiFocus.ID matches a specific TechID (with polling and Enter retries)
+Private Function WaitFocusBecomes(ByVal ses As Object, ByVal targetId As String, ByVal maxTries As Long) As Boolean
+    Dim i As Long, j As Long, cur As String
+    For i = 1 To maxTries
+        ses.findById("wnd[0]").sendVKey 0
+        Call SapWaitIdle(ses, 0.4)
+        For j = 1 To 10
+            DoEvents
+            cur = ""
+            On Error Resume Next
+            cur = CStr(ses.findById("wnd[0]").GuiFocus.id)
+            On Error GoTo 0
+            If StrComp(cur, targetId, vbTextCompare) = 0 Then
+                WaitFocusBecomes = True
+                Exit Function
+            End If
+            Call SapWaitIdle(ses, 0.2)
+        Next j
+    Next i
+    WaitFocusBecomes = False
+End Function
+
+' =======================
+' NEW: status/popup + unlock helpers used above
+' =======================
+
+' Read SAP status bar (type + text)
+Private Sub SD_GetStatusBar(ByVal ses As Object, ByRef typ As String, ByRef txt As String)
+    On Error Resume Next
+    Dim s As Object: Set s = ses.findById("wnd[0]/sbar")
+    If Not s Is Nothing Then
+        typ = CStr(s.MessageType)  ' E/A/W/S/I or ""
+        txt = CStr(s.Text)
+    Else
+        typ = "": txt = ""
+    End If
+End Sub
+
+' Clear common popups so they don't swallow Enter
+Private Sub SweepCommonPopups(ByVal ses As Object)
+    On Error Resume Next
+    If SapExistsId(ses, "wnd[1]") Then
+        SapHandleCommonPopups ses
+    End If
+End Sub
+
+
+' Fast path: commit dates once, then jump focus to Reference if it exists.
+' Assumes no hard (E/A) errors will appear in production.
+Public Function P10_SD_AdvanceFromDatesToRef(ByVal ses As Object, ByVal refId As String) As Boolean
+    On Error GoTo Done
+    ' Commit whatever is in the date fields
+    ses.findById("wnd[0]").sendVKey 0
+    SapWaitIdle ses, 0.2
+    SapTryDismissPopup ses
+
+    ' If Reference exists, force focus there
+    If SapWaitForId(ses, refId, 2#) Then
+        ses.findById(refId).SetFocus
+        SapWaitIdle ses, 0.1
+        P10_SD_AdvanceFromDatesToRef = True
+        Exit Function
+    End If
+
+Done:
+End Function
+
+' Handle red¡æyellow flow and FORCE focus to Reference once hard errors clear.
+Private Function K10_SD_AdvanceFromDatesToRef( _
+    ByVal ses As Object, _
+    ByVal maxTries As Long, _
+    ByVal refId As String, _
+    ParamArray dateIds() As Variant) As Boolean
+
+    Dim i As Long, cur As String, typ As String, msg As String
+    Dim movedOff As Boolean, k As Long
+
+    For i = 1 To maxTries
+        SweepCommonPopups ses
+        ses.findById("wnd[0]").sendVKey 0
+        SapWaitIdle ses, 0.4
+
+        On Error Resume Next
+        cur = CStr(ses.findById("wnd[0]").GuiFocus.id)
+        On Error GoTo 0
+        SD_GetStatusBar ses, typ, msg
+        Dbg "Enter#" & i & " | Focus=" & cur & " | SBar=[" & typ & "] " & msg
+
+        ' Landed on Reference?
+        If StrComp(cur, refId, vbTextCompare) = 0 Then
+            SD_AdvanceFromDatesToRef = True
+            Exit Function
+        End If
+
+        ' While E/A (hard errors), keep looping
+        If typ = "E" Or typ = "A" Then GoTo NextTry
+
+        ' W/S/blank ¡æ ok to force focus to Reference
+        If SapWaitForId(ses, refId, 2#) Then
+            On Error Resume Next
+            ses.findById(refId).SetFocus
+            On Error GoTo 0
+            SapWaitIdle ses, 0.2
+
+            On Error Resume Next
+            cur = CStr(ses.findById("wnd[0]").GuiFocus.id)
+            On Error GoTo 0
+            If StrComp(cur, refId, vbTextCompare) = 0 Then
+                SD_AdvanceFromDatesToRef = True
+                Exit Function
+            End If
+        End If
+
+        ' Fallback: moved off BOTH date fields ¡æ good enough
+        movedOff = (Len(cur) > 0)
+        For k = LBound(dateIds) To UBound(dateIds)
+            If StrComp(cur, CStr(dateIds(k)), vbTextCompare) = 0 Then
+                movedOff = False
+                Exit For
+            End If
+        Next k
+        If movedOff Then
+            SD_AdvanceFromDatesToRef = True
+            Exit Function
+        End If
+
+NextTry:
+    Next i
+End Function
+
+
+' Open-for-input check: tries .Changeable, falls back to .Editable if needed
+Public Function SD_IsOpenForInput(ByVal ses As Object, ByVal techId As String) As Boolean
+    On Error Resume Next
+    Dim o As Object: Set o = ses.findById(techId)
+    If o Is Nothing Then Exit Function
+
+    Err.Clear
+    SD_IsOpenForInput = CBool(o.Changeable)
+    If Err.Number <> 0 Then
+        Err.Clear
+        SD_IsOpenForInput = CBool(o.Editable)
+    End If
+End Function
+' Try to set a text field if it exists; no Enter; silent skip if missing.
+Private Function SD_TrySetText_NoEnter( _
+    ByVal ses As Object, _
+    ByVal techId As String, _
+    ByVal val As String _
+) As Boolean
+    On Error Resume Next
+    If Len(techId) = 0 Then SD_TrySetText_NoEnter = True: Exit Function
+    If Not SapExistsId(ses, techId) Then SD_TrySetText_NoEnter = True: Exit Function
+
+    Dim o As Object: Set o = ses.findById(techId)
+    o.Text = vbNullString
+    o.Text = val
+    SD_TrySetText_NoEnter = (Err.Number = 0)
+    Err.Clear
+End Function
+
+Private Function SD_SetTotals_ThenTax( _
+    ByVal ses As Object, _
+    ByVal totalAmt As Variant, _
+    ByVal taxAmt As Variant, _
+    ByVal curr As String, _
+    ByVal basicTxt As String _
+) As Boolean
+    On Error GoTo EH
+
+    ' 1) Amount / Currency / Optional header text ? NO Enter
+    Call SD_TrySetText_NoEnter(ses, ID_WRBTR, ToSapAmount(totalAmt))
+    Call SD_TrySetText_NoEnter(ses, ID_WAERS, Trim$(curr))
+    Call SD_TrySetText_NoEnter(ses, ID_TEXT, Left$(Trim$(basicTxt), 50))
+
+    ' 2) Decide code using epsilon zero
+    Dim wantZero As Boolean
+    wantZero = IsEffectivelyZero(taxAmt)
+
+    ' 3) Tax amount field policy:
+    '    - If zero ¡æ clear the field (don¡¯t write ¡°0¡±)
+    '    - If >0  ¡æ write the tax amount
+    If SapExistsId(ses, ID_TAXAMT) Then
+        If wantZero Then
+            SD_ClearIfExists ses, ID_TAXAMT
+        Else
+            Call SD_TrySetText_NoEnter(ses, ID_TAXAMT, ToSapAmount(taxAmt))
+        End If
+    End If
+
+    ' 4) Now set tax code, then immediately handle any modal
+    Dim taxKey As String: taxKey = IIf(wantZero, "VZ", "V5")
+
+    If Not SD_SetTaxCodeVerified(ses, taxKey) Then GoTo EH
+
+    SapTryDismissPopup ses
+    SapWaitIdle ses, 0.3
+
+    ' 5) Double-check no lingering popup
+    If SapExistsId(ses, "wnd[1]") Then
+        SapTryDismissPopup ses
+        SapWaitIdle ses, 0.2
+        If SapExistsId(ses, "wnd[1]") Then GoTo EH
+    End If
+
+    SD_SetTotals_ThenTax = True
+    Exit Function
+EH:
+    SD_SetTotals_ThenTax = False
+End Function
 
 
 
-' In SD_MIRO_Config
-'Public Const DEFAULT_COMPANY_CODE As String = "0252"
-'Public Const ALWAYS_PROMPT_COMPANY_CODE As Boolean = True   ' False = use default silently
 
 
-' ========= Sheet & Row Range =========
-Public Const SD_SHEET           As String = "SD"
-Public Const VENDOR_SHEET       As String = "CZK Vendor Master"
-Public Const FIRST_DATA_ROW     As Long = 2
-Public Const LAST_DATA_ROW      As Long = 10000
+' Set Vendor (LIFRE) and Header Text (BKTXT) without relying on focus-move.
+' Writes both ¡æ single Enter ¡æ checks status bar (no E/A). Returns True on OK.
+Private Function SD_SetVendorAndText_NoMove( _
+    ByVal ses As Object, _
+    ByVal vendor As String, _
+    ByVal headerTxt As String _
+) As Boolean
+    On Error GoTo EH
+    Dim typ As String, msg As String
 
-' ========= House Style =========
-Public Const APP_FONT_NAME      As String = "ZEISS Frutiger Next W1G"
-Public Const APP_FONT_SIZE      As Long = 9
+    ' We are already on FI tab when this is called; just write
+    Call SD_TrySetText_NoEnter(ses, ID_VENDOR, vendor)            ' INVFO-LIFRE
+    Call SD_TrySetText_NoEnter(ses, ID_HEADER_TEXT, headerTxt)  ' INVFO-BKTXT
 
-' ========= Column Map (letters on SD) =========
-Public Const COL_VENDOR_CODE    As String = "B"  ' Vendor
-Public Const COL_DATE           As String = "D"  ' Invoice & Posting Date
-Public Const COL_HEADER_TEXT    As String = "E"  ' Text (BKTXT)
-Public Const COL_REFERENCE      As String = "F"  ' Reference (XBLNR)
-Public Const COL_CURRENCY       As String = "G"  ' WAERS
-Public Const COL_TAXAMT         As String = "H"  ' >0 => V5 else VZ
-Public Const COL_TOTAL_AMOUNT   As String = "J"  ' WRBTR
-Public Const COL_PO             As String = "L"  ' PO(s): "4500.../4500..."
+    ' One Enter to validate both
+    ses.findById("wnd[0]").sendVKey 0
+    SapWaitIdle ses, 0.4
+    SapTryDismissPopup ses
 
-' ========= MIRO TechIDs =========
-Public Const ID_OKCODE          As String = "wnd[0]/tbar[0]/okcd"
+    ' Status bar must not be Error/Abort
+    SD_GetStatusBar ses, typ, msg
+    SD_SetVendorAndText_NoMove = Not (typ = "E" Or typ = "A")
+    Exit Function
+EH:
+    SD_SetVendorAndText_NoMove = False
+End Function
 
-' Header ? TOTAL
-Public Const ID_TAB_HDR_TOTAL   As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_TOTAL"
-Public Const ID_BLDAT           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_TOTAL/ssubHEADER_SCREEN:SAPLFDCB:0010/ctxtINVFO-BLDAT"
-Public Const ID_BUDAT           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_TOTAL/ssubHEADER_SCREEN:SAPLFDCB:0010/ctxtINVFO-BUDAT"
-Public Const ID_XBLNR           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_TOTAL/ssubHEADER_SCREEN:SAPLFDCB:0010/txtINVFO-XBLNR"
-Public Const ID_WRBTR           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_TOTAL/ssubHEADER_SCREEN:SAPLFDCB:0010/txtINVFO-WRBTR"
-Public Const ID_WAERS           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_TOTAL/ssubHEADER_SCREEN:SAPLFDCB:0010/ctxtINVFO-WAERS"
-Public Const ID_MWSKZ           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_TOTAL/ssubHEADER_SCREEN:SAPLFDCB:0010/cmbINVFO-MWSKZ"
+Private Function SapSafeSelect(ByVal ses As Object, ByVal fullId As String, Optional ByVal timeoutSec As Double = 8) As Boolean
+    If Not SapWaitForId(ses, fullId, timeoutSec) Then Exit Function
+    On Error Resume Next
+    ses.findById(fullId).Select
+    SapSafeSelect = (Err.Number = 0)
+    Err.Clear
+End Function
 
-' Header ? FI
-Public Const ID_TAB_HDR_FI      As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_FI"
-Public Const ID_LIFRE           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_FI/ssubHEADER_SCREEN:SAPLFDCB:0150/ctxtINVFO-LIFRE"
-Public Const ID_BKTXT           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_FI/ssubHEADER_SCREEN:SAPLFDCB:0150/txtINVFO-BKTXT"
 
-' Items ? PO tab
-Public Const ID_ITEM_PO_FIELD   As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/subITEMS:SAPLMR1M:6010/tabsITEMTAB/tabpITEMS_PO/ssubTABS:SAPLMR1M:6020/subREFERENZBELEG:SAPLMR1M:6211/ctxtRM08M-EBELN"
-Public Const ID_PO_MULTI_BTN    As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/subITEMS:SAPLMR1M:6010/tabsITEMTAB/tabpITEMS_PO/ssubTABS:SAPLMR1M:6020/subREFERENZBELEG:SAPLMR1M:6211/btnRM08M-XMSEL"
-Public Const ID_PO_MULTI_TABLE  As String = "wnd[1]/usr/tabsTAB_STRIP/tabpSIVA/ssubSCREEN_HEADER:SAPLALDB:3010/tblSAPLALDBSINGLE"
-Public Const ID_PO_MULTI_OK     As String = "wnd[1]/tbar[0]/btn[8]"
 
-' Transaction type (Subsequent Debit)
-Public Const ID_VORGANG         As String = "wnd[0]/usr/cmbRM08M-VORGANG"
-Public Const KEY_VORGANG_SD     As String = "3"
 
-' Optional
-Public Const ID_ITEM_SELECT_ALL As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/subITEMS:SAPLMR1M:6010/tabsITEMTAB/tabpITEMS_PO/ssubTABS:SAPLMR1M:6020/subITEM:SAPLMR1M:6310/btnSELECT_ALL"
+' Zero test with tolerance
+Private Function IsEffectivelyZero(ByVal v As Variant, Optional ByVal eps As Double = 0.000001) As Boolean
+    Dim x As Double
+    If IsError(v) Or IsEmpty(v) Or Len(Trim$(CStr(v))) = 0 Then
+        IsEffectivelyZero = True
+        Exit Function
+    End If
+    On Error Resume Next
+    x = CDbl(v)
+    On Error GoTo 0
+    IsEffectivelyZero = (Abs(x) <= eps)
+End Function
 
+' Clear a text field if it exists
+Private Sub SD_ClearIfExists(ByVal ses As Object, ByVal techId As String)
+    On Error Resume Next
+    If SapExistsId(ses, techId) Then
+        ses.findById(techId).Text = vbNullString
+    End If
+End Sub
+
+' Read back the current tax code key/text for verification/logging
+Private Function SD_ReadTaxCode(ByVal ses As Object, ByRef keyOut As String, ByRef textOut As String) As Boolean
+    On Error Resume Next
+    Dim o As Object: Set o = ses.findById(ID_TAX_CODE)
+    If o Is Nothing Then Exit Function
+    Err.Clear
+    keyOut = CStr(o.key)  ' may error on some GUIs
+    If Err.Number <> 0 Then keyOut = "": Err.Clear
+    textOut = CStr(o.Text)
+    SD_ReadTaxCode = True
+End Function
+
+' Set tax code robustly and verify; retry once if needed
+Private Function SD_SetTaxCodeVerified(ByVal ses As Object, ByVal taxKey As String) As Boolean
+    Dim ok As Boolean, k As String, t As String
+
+    ' Use your safe setter if available; fall back to .Key
+    ok = SapSafeSetKey(ses, ID_TAX_CODE, taxKey)
+    If Not ok Then
+        On Error Resume Next
+        ses.findById(ID_TAX_CODE).key = taxKey
+        ok = (Err.Number = 0)
+        Err.Clear
+        On Error GoTo 0
+    End If
+
+    SapWaitIdle ses, 0.2
+    SapTryDismissPopup ses
+    SapWaitIdle ses, 0.2
+
+    Call SD_ReadTaxCode(ses, k, t)
+    Dbg "Tax code after set (1st try): key='" & k & "' text='" & t & "'"
+
+    If StrComp(k, taxKey, vbTextCompare) = 0 Or InStr(1, t, taxKey, vbTextCompare) > 0 Then
+        SD_SetTaxCodeVerified = True
+        Exit Function
+    End If
+
+    ' One gentle retry (commit/settle + set again)
+    ses.findById("wnd[0]").sendVKey 0
+    SapWaitIdle ses, 0.4
+    SapTryDismissPopup ses
+    SapWaitIdle ses, 0.2
+
+    ok = SapSafeSetKey(ses, ID_TAX_CODE, taxKey)
+    If Not ok Then
+        On Error Resume Next
+        ses.findById(ID_TAX_CODE).key = taxKey
+        ok = (Err.Number = 0)
+        Err.Clear
+        On Error GoTo 0
+    End If
+
+    SapWaitIdle ses, 0.2
+    Call SD_ReadTaxCode(ses, k, t)
+    Dbg "Tax code after set (retry): key='" & k & "' text='" & t & "'"
+
+    SD_SetTaxCodeVerified = (StrComp(k, taxKey, vbTextCompare) = 0 Or InStr(1, t, taxKey, vbTextCompare) > 0)
+End Function
+
+' Copy the current value of ID_DIFF_COST into ID_UNPL_DEL_COST
+' Does Enter/settle and clears popups; returns True if no red/abort on SBAR.
+Private Function SD_CopyDiffCostToUnpl(ByVal ses As Object) As Boolean
+    Dim txt As String
+    Dim i As Long
+
+    ' Be defensive: clear any modal before we start
+    SapTryDismissPopup ses
+
+    ' Read source (diff) text
+    If Not SapWaitForId(ses, ID_DIFF_COST, 3#) Then Exit Function
+    On Error Resume Next
+    txt = Trim$(CStr(ses.findById(ID_DIFF_COST).Text))
+    On Error GoTo 0
+
+    ' Nothing to copy ? treat as success but no-op
+    If Len(txt) = 0 Then SD_CopyDiffCostToUnpl = True: Exit Function
+
+    ' Truncate to 50 just like your header text policy
+    txt = Left$(txt, 50)
+
+    ' Write to UNPL_DEL_COST with a few retries to ride out popups
+    For i = 1 To 3
+        If Not SapWaitForId(ses, ID_UNPL_DEL_COST, 3#) Then GoTo NextTry
+
+        On Error Resume Next
+        ses.findById(ID_UNPL_DEL_COST).Text = vbNullString
+        ses.findById(ID_UNPL_DEL_COST).Text = txt
+        On Error GoTo 0
+
+        ' Commit + sweep popups, then verify status bar not E/A
+        ses.findById("wnd[0]").sendVKey 0
+        SapWaitIdle ses, 0.3
+        SapTryDismissPopup ses
+        SapWaitIdle ses, 0.2
+
+        If IsStatusBarOk(ses) Then
+            SD_CopyDiffCostToUnpl = True
+            Exit Function
+        End If
+
+NextTry:
+        SapTryDismissPopup ses
+        SapWaitIdle ses, 0.3
+    Next i
+End Function
+' Find first ctxt cell under a table and return the base ".../ctxt...EBELN" and the column index
+Private Function GetFirstCtxtPatternUnderTable(ByVal s As Object, _
+                                               ByVal tableId As String, _
+                                               ByRef cellBase As String, _
+                                               ByRef colIdx As Long) As Boolean
+    Dim tbl As Object, ch As Object, id As String
+    Dim posL As Long, posComma As Long
+    If Not SapExistsId(s, tableId) Then Exit Function
+    Set tbl = s.findById(tableId)
+
+    Dim i As Long
+    For i = 0 To SapChildCount(tbl) - 1
+        Set ch = SapGetChild(tbl, i)
+        On Error Resume Next
+        id = CStr(ch.id)
+        On Error GoTo 0
+        If InStr(1, id, "ctxtRM08M-EBELN", vbTextCompare) > 0 Then
+            posL = InStr(id, "[")
+            posComma = InStr(id, ",")
+            If posL > 0 And posComma > posL Then
+                cellBase = Left$(id, posL - 1)        ' e.g. .../ctxtRM08M-EBELN
+                colIdx = CLng(Mid$(id, posL + 1, posComma - posL - 1))  ' e.g. 0
+                GetFirstCtxtPatternUnderTable = True
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
