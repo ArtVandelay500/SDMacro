@@ -1,59 +1,167 @@
 Option Explicit
+' Uses constants from SD_MIRO_Config:
+'   SD_SHEET, VENDOR_SHEET, FIRST_DATA_ROW, LAST_DATA_ROW
+'   APP_FONT_NAME, APP_FONT_SIZE
 
+Public Sub SetupSheetRules()
+    Dim ws As Worksheet, wsVM As Worksheet
+    Dim rng As Range
+    Dim lastA As Long, lastB As Long
+    Dim codeRange As Range, nameRange As Range
+    Dim sep As String: sep = Application.International(xlListSeparator)
 
+    Set ws = ThisWorkbook.Worksheets(SD_SHEET)
 
-' In SD_MIRO_Config
-'Public Const DEFAULT_COMPANY_CODE As String = "0252"
-'Public Const ALWAYS_PROMPT_COMPANY_CODE As Boolean = True   ' False = use default silently
+    On Error Resume Next
+    Set wsVM = ThisWorkbook.Worksheets(VENDOR_SHEET)
+    On Error GoTo 0
 
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    On Error GoTo CleanExit
 
-' ========= Sheet & Row Range =========
-Public Const SD_SHEET           As String = "SD"
-Public Const VENDOR_SHEET       As String = "CZK Vendor Master"
-Public Const FIRST_DATA_ROW     As Long = 2
-Public Const LAST_DATA_ROW      As Long = 10000
+    ' --- Working range ---
+    Set rng = ws.Range("A" & FIRST_DATA_ROW & ":Q" & LAST_DATA_ROW)
 
-' ========= House Style =========
-Public Const APP_FONT_NAME      As String = "ZEISS Frutiger Next W1G"
-Public Const APP_FONT_SIZE      As Long = 9
+    ' --- Clear old validation/CF ---
+    On Error Resume Next
+    rng.Validation.Delete
+    rng.FormatConditions.Delete
+    On Error GoTo 0
 
-' ========= Column Map (letters on SD) =========
-Public Const COL_VENDOR_CODE    As String = "B"  ' Vendor
-Public Const COL_DATE           As String = "D"  ' Invoice & Posting Date
-Public Const COL_HEADER_TEXT    As String = "E"  ' Text (BKTXT)
-Public Const COL_REFERENCE      As String = "F"  ' Reference (XBLNR)
-Public Const COL_CURRENCY       As String = "G"  ' WAERS
-Public Const COL_TAXAMT         As String = "H"  ' >0 => V5 else VZ
-Public Const COL_TOTAL_AMOUNT   As String = "J"  ' WRBTR
-Public Const COL_PO             As String = "L"  ' PO(s): "4500.../4500..."
+    ' --- House style ---
+    With rng.Font
+        .Name = APP_FONT_NAME
+        .Size = APP_FONT_SIZE
+    End With
 
-' ========= MIRO TechIDs =========
-Public Const ID_OKCODE          As String = "wnd[0]/tbar[0]/okcd"
+    ' --- Number formats ---
+    ws.Range("D" & FIRST_DATA_ROW & ":D" & LAST_DATA_ROW).NumberFormat = "yyyy.mm.dd"
+    ws.Range("H" & FIRST_DATA_ROW & ":J" & LAST_DATA_ROW).NumberFormat = "#,##0.00"
+    ws.Range("L" & FIRST_DATA_ROW & ":L" & LAST_DATA_ROW).NumberFormat = "0"
+    ws.Range("N" & FIRST_DATA_ROW & ":N" & LAST_DATA_ROW).NumberFormat = "0"
+    ws.Range("O" & FIRST_DATA_ROW & ":O" & LAST_DATA_ROW).NumberFormat = "@"
+    ws.Range("P" & FIRST_DATA_ROW & ":Q" & LAST_DATA_ROW).NumberFormat = "0"
 
-' Header ? TOTAL
-Public Const ID_TAB_HDR_TOTAL   As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_TOTAL"
-Public Const ID_BLDAT           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_TOTAL/ssubHEADER_SCREEN:SAPLFDCB:0010/ctxtINVFO-BLDAT"
-Public Const ID_BUDAT           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_TOTAL/ssubHEADER_SCREEN:SAPLFDCB:0010/ctxtINVFO-BUDAT"
-Public Const ID_XBLNR           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_TOTAL/ssubHEADER_SCREEN:SAPLFDCB:0010/txtINVFO-XBLNR"
-Public Const ID_WRBTR           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_TOTAL/ssubHEADER_SCREEN:SAPLFDCB:0010/txtINVFO-WRBTR"
-Public Const ID_WAERS           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_TOTAL/ssubHEADER_SCREEN:SAPLFDCB:0010/ctxtINVFO-WAERS"
-Public Const ID_MWSKZ           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_TOTAL/ssubHEADER_SCREEN:SAPLFDCB:0010/cmbINVFO-MWSKZ"
+    ' --- Named ranges for Vendor Master (robust for DV) ---
+    If Not wsVM Is Nothing Then
+        lastA = wsVM.Cells(wsVM.Rows.Count, 1).End(xlUp).row
+        lastB = wsVM.Cells(wsVM.Rows.Count, 2).End(xlUp).row
 
-' Header ? FI
-Public Const ID_TAB_HDR_FI      As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_FI"
-Public Const ID_LIFRE           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_FI/ssubHEADER_SCREEN:SAPLFDCB:0150/ctxtINVFO-LIFRE"
-Public Const ID_BKTXT           As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/tabsHEADER/tabpHEADER_FI/ssubHEADER_SCREEN:SAPLFDCB:0150/txtINVFO-BKTXT"
+        Dim qSheet As String: qSheet = "'" & Replace(wsVM.Name, "'", "''") & "'!"
+        Dim refCodes As String, refNames As String
 
-' Items ? PO tab
-Public Const ID_ITEM_PO_FIELD   As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/subITEMS:SAPLMR1M:6010/tabsITEMTAB/tabpITEMS_PO/ssubTABS:SAPLMR1M:6020/subREFERENZBELEG:SAPLMR1M:6211/ctxtRM08M-EBELN"
-Public Const ID_PO_MULTI_BTN    As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/subITEMS:SAPLMR1M:6010/tabsITEMTAB/tabpITEMS_PO/ssubTABS:SAPLMR1M:6020/subREFERENZBELEG:SAPLMR1M:6211/btnRM08M-XMSEL"
-Public Const ID_PO_MULTI_TABLE  As String = "wnd[1]/usr/tabsTAB_STRIP/tabpSIVA/ssubSCREEN_HEADER:SAPLALDB:3010/tblSAPLALDBSINGLE"
-Public Const ID_PO_MULTI_OK     As String = "wnd[1]/tbar[0]/btn[8]"
+        If lastA >= 2 Then
+            Set codeRange = wsVM.Range(wsVM.Cells(2, 1), wsVM.Cells(lastA, 1))
+            refCodes = "=" & qSheet & codeRange.Address(True, True, xlA1)
+        Else
+            refCodes = "=" & qSheet & "$A$1"
+        End If
+        If NameExists("VM_Codes") Then
+            ThisWorkbook.Names("VM_Codes").RefersTo = refCodes
+        Else
+            ThisWorkbook.Names.Add Name:="VM_Codes", RefersTo:=refCodes
+        End If
 
-' Transaction type (Subsequent Debit)
-Public Const ID_VORGANG         As String = "wnd[0]/usr/cmbRM08M-VORGANG"
-Public Const KEY_VORGANG_SD     As String = "3"
+        If lastB >= 2 Then
+            Set nameRange = wsVM.Range(wsVM.Cells(2, 2), wsVM.Cells(lastB, 2))
+            refNames = "=" & qSheet & nameRange.Address(True, True, xlA1)
+        Else
+            refNames = "=" & qSheet & "$B$1"
+        End If
+        If NameExists("VM_Names") Then
+            ThisWorkbook.Names("VM_Names").RefersTo = refNames
+        Else
+            ThisWorkbook.Names.Add Name:="VM_Names", RefersTo:=refNames
+        End If
+    End If
 
-' Optional
-Public Const ID_ITEM_SELECT_ALL As String = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/subITEMS:SAPLMR1M:6010/tabsITEMTAB/tabpITEMS_PO/ssubTABS:SAPLMR1M:6020/subITEM:SAPLMR1M:6310/btnSELECT_ALL"
+    ' --- VALIDATION (only safe types; event code enforces the rest) ---
+
+    ' B: Vendor Code (named range), only if Vendor Master exists
+    If Not wsVM Is Nothing Then
+        With ws.Range("B" & FIRST_DATA_ROW & ":B" & LAST_DATA_ROW).Validation
+            .Delete
+            .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Formula1:="=VM_Codes"
+            .IgnoreBlank = True
+            .InCellDropdown = True
+            .InputTitle = "Vendor Code"
+            .ErrorTitle = "Invalid Vendor Code"
+            .ErrorMessage = "Choose a code from '" & wsVM.Name & "'."
+        End With
+    End If
+
+    ' C: Vendor Name (named range), only if Vendor Master exists
+    If Not wsVM Is Nothing Then
+        With ws.Range("C" & FIRST_DATA_ROW & ":C" & LAST_DATA_ROW).Validation
+            .Delete
+            .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Formula1:="=VM_Names"
+            .IgnoreBlank = True
+            .InCellDropdown = True
+            .InputTitle = "Vendor Name"
+            .ErrorTitle = "Invalid Vendor Name"
+            .ErrorMessage = "Choose a name from '" & wsVM.Name & "'."
+        End With
+    End If
+
+    ' G: Currency (literal list; NO "=")
+    With ws.Range("G" & FIRST_DATA_ROW & ":G" & LAST_DATA_ROW).Validation
+        .Delete
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Formula1:="USD" & sep & "EUR" & sep & "KRW"
+        .IgnoreBlank = True
+        .InCellDropdown = True
+        .InputTitle = "Currency"
+        .ErrorTitle = "Invalid"
+        .ErrorMessage = "Only USD, EUR or KRW are allowed."
+    End With
+
+    ' K: Type (literal list; NO "=")
+    With ws.Range("K" & FIRST_DATA_ROW & ":K" & LAST_DATA_ROW).Validation
+        .Delete
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Formula1:="PO" & sep & "MAT" & sep & "GL"
+        .IgnoreBlank = True
+        .InCellDropdown = True
+        .InputTitle = "Type"
+        .ErrorTitle = "Invalid"
+        .ErrorMessage = "Only PO, MAT or GL are allowed."
+    End With
+
+    ' (No custom DV on F/L/M/N/P/Q here ? your Worksheet_Change enforces those rules.)
+
+    ' --- J: formula = H + I (blank unless both exist) ---
+    ws.Range("J" & FIRST_DATA_ROW & ":J" & LAST_DATA_ROW).FormulaR1C1 = _
+        "=IF(AND(RC[-2]<>"""",RC[-1]<>""""),RC[-2]+RC[-1],"""")"
+
+    ' --- Optional: highlight if any mandatory field blank (B,C,D,F,G,H,I,J,K,L) ---
+    Dim man As String
+    man = "=OR(" & _
+          "B" & FIRST_DATA_ROW & "=""""," & _
+          "C" & FIRST_DATA_ROW & "=""""," & _
+          "D" & FIRST_DATA_ROW & "=""""," & _
+          "F" & FIRST_DATA_ROW & "=""""," & _
+          "G" & FIRST_DATA_ROW & "=""""," & _
+          "H" & FIRST_DATA_ROW & "=""""," & _
+          "I" & FIRST_DATA_ROW & "=""""," & _
+          "J" & FIRST_DATA_ROW & "=""""," & _
+          "K" & FIRST_DATA_ROW & "=""""," & _
+          "L" & FIRST_DATA_ROW & "="""")"
+    With ws.Range("A" & FIRST_DATA_ROW & ":Q" & LAST_DATA_ROW).FormatConditions.Add( _
+        Type:=xlExpression, Formula1:=man)
+        .Interior.Color = RGB(255, 245, 245)
+    End With
+
+    MsgBox "Setup complete on " & ws.Name & ".", vbInformation
+
+CleanExit:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+End Sub
+
+Private Function NameExists(ByVal nm As String) As Boolean
+    Dim n As Name
+    On Error Resume Next
+    Set n = ThisWorkbook.Names(nm)
+    NameExists = Not n Is Nothing
+End Function
+
 
