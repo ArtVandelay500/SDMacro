@@ -10,8 +10,8 @@ Option Explicit
 ' ========= Sheet & Row Range =========
 Public Const SD_SHEET           As String = "SD"
 Public Const VENDOR_SHEET       As String = "CZK Vendor Master"
-Public Const FIRST_DATA_ROW     As Long = 2
-Public Const LAST_DATA_ROW      As Long = 2
+Public Const FIRST_DATA_ROW     As Long = 7
+Public Const LAST_DATA_ROW      As Long = 16
 
 ' ========= House Style =========
 Public Const APP_FONT_NAME      As String = "ZEISS Frutiger Next W1G"
