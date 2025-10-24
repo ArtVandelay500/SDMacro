@@ -1,0 +1,298 @@
+Option Explicit
+
+' ==== Sheet / Cell config ====
+' These constants tell the code where to read user inputs from.
+' - SHEET_DWNLD : the sheet that contains the controls/inputs.
+' - CELL_DEPT   : the cell containing the Company Code/Dept (e.g., "0130").
+' - CELL_INV    : the cell containing either a single invoice number
+'                 or a slash-separated list of invoice numbers.
+' - CELL_OUT    : the cell containing the output directory to save files.
+Private Const SHEET_DWNLD As String = "DWNLD"
+Private Const CELL_DEPT   As String = "D3"
+Private Const CELL_INV    As String = "D4"
+Private Const CELL_OUT    As String = "D5"
+
+' -----------------------------------------------------------------------------
+' SpeedGuard(onOff)
+' Purpose:
+'   Temporarily disables Excel UI features that slow down macros (screen redraw,
+'   auto-calculation, event firing, etc.). Call with True at the start of a
+'   long routine and with False in a Cleanup/EH path to restore previous state.
+'
+' Parameters:
+'   onOff : True = turn ON the guard (disable UI stuff); False = turn it OFF.
+'
+' Notes:
+'   - Uses a Static variable to remember the user's calc mode so it can be
+'     restored correctly.
+'   - Always make sure you call SpeedGuard False in any Exit/EH path.
+' -----------------------------------------------------------------------------
+Private Sub SpeedGuard(ByVal onOff As Boolean)
+    Static prevCalc As XlCalculation
+    On Error Resume Next
+    If onOff Then
+        prevCalc = Application.Calculation
+        Application.ScreenUpdating = False
+        Application.EnableEvents = False
+        Application.Calculation = xlCalculationManual
+        Application.DisplayStatusBar = False
+    Else
+        Application.ScreenUpdating = True
+        Application.EnableEvents = True
+        Application.Calculation = prevCalc
+        Application.DisplayStatusBar = True
+    End If
+End Sub
+
+' -----------------------------------------------------------------------------
+' SAP_DownloadInvoice_FromSheet()
+' Purpose:
+'   End-to-end flow for your “Download invoice” button:
+'     1) Read inputs (Dept/Company Code, Invoice(s), Output folder) from sheet.
+'     2) Get an SAP session on Z114_FIDOC (without hijacking other windows).
+'     3) Navigate and populate fields on the "Doc.head" and "General" tabs.
+'     4) Execute (F8) to start download/export.
+'
+' Behavior:
+'   - For a single invoice, the code puts it into the S_BELNRH-LOW field.
+'   - For many invoices (slash-separated), it uses SAP’s “Multiple selection”
+'     popup and pastes them row-by-row.
+'   - Always refreshes the screen (/n + tcode) so we start from a clean layout
+'     even if the session was reused.
+'
+' Error handling:
+'   - Shows a clear MsgBox per failure and restores Excel speed settings.
+' -----------------------------------------------------------------------------
+Public Sub SAP_DownloadInvoice_FromSheet()
+    On Error GoTo EH
+    SpeedGuard True
+
+    ' ---------- Read inputs from the sheet ----------
+    Dim ws As Worksheet, rawDept As String, dept As String
+    Dim inv As String, outDir As String
+    Dim sess As Object
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_DWNLD)
+    rawDept = Trim$(CStr(ws.Range(CELL_DEPT).value))
+    inv = Trim$(CStr(ws.Range(CELL_INV).value))
+    outDir = Trim$(CStr(ws.Range(CELL_OUT).value))
+
+    ' Validate Dept/Company Code
+    If Len(rawDept) = 0 Then
+        MsgBox "Enter Dept (e.g., 0130) in " & CELL_DEPT, vbExclamation
+        ws.Range(CELL_DEPT).Select: GoTo Cleanup
+    End If
+    ' Pad-left with zeros to 4 chars WITHOUT numeric conversion (keeps leading zeros)
+    dept = Right$("0000" & rawDept, 4)
+
+    ' Validate output folder
+    If Len(outDir) = 0 Then
+        MsgBox "Enter Output Directory in " & CELL_OUT, vbExclamation
+        ws.Range(CELL_OUT).Select: GoTo Cleanup
+    End If
+    ' Ensure the folder path exists; create intermediate folders if needed
+    If Len(Dir(outDir, vbDirectory)) = 0 Then MkDirsSafe outDir
+
+    ' ---------- SAP session (WIP-safe, force clean start) ----------
+    ' SapGetSessionByTCode comes from modSAP (the shared SAP helper module).
+    ' - PreferReuse:=True  → Reuse a proper session if already on this TCode
+    ' - ResetOnReuse:=True → Do /n + tcode even when reused (fresh UI)
+    ' - ShowStatus:=False  → No status bar noise in Excel
+    Set sess = SapGetSessionByTCode("P10", "010", "Z114_FIDOC", _
+                                    PreferReuse:=True, ResetOnReuse:=True, ShowStatus:=False)
+    If sess Is Nothing Then Err.Raise vbObjectError + 100, , "Could not prepare SAP session."
+
+    ' Force the session’s main window onto a clean Z114_FIDOC screen and wait
+    ' for the tabstrip to exist so further finds won’t race.
+    Call SapEnsureOnTCode(sess, "Z114_FIDOC", 8#)
+
+    ' ---------- UI anchors and field IDs for this transaction ----------
+    ' For reliability we use:
+    '   - a tabstrip container root (so we can pick tabs quickly)
+    '   - full IDs (fast path) AND suffix fallbacks (survive minor layout changes)
+    Const TABSTRIP_ROOT As String = "wnd[0]/usr/tabsTABSTRIP_ENTRY"
+    Const TAB_DOC_HEAD  As String = "tabpUCOMM_HD" ' "Doc.head" tab TechID suffix
+    Const TAB_GENERAL   As String = "tabpUCOMM_PR" ' "General" tab TechID suffix
+
+    ' Doc.head: the “Include Header” checkbox and Company Code/Dept field
+    Const FULL_HDR_CHECK_INCLUDE As String = _
+      "wnd[0]/usr/tabsTABSTRIP_ENTRY/tabpUCOMM_HD/ssub%_SUBSCREEN_ENTRY:Z1140100:1400/chkX_HDINP"
+    Const SUF_HDR_CHECK_INCLUDE  As String = "chkX_HDINP"
+
+    Const FULL_BUKRS_FIELD As String = _
+      "wnd[0]/usr/tabsTABSTRIP_ENTRY/tabpUCOMM_HD/ssub%_SUBSCREEN_ENTRY:Z1140100:1400/ctxtS_BUKRSH-LOW"
+    Const SUF_BUKRS_FIELD  As String = "ctxtS_BUKRSH-LOW"
+
+    ' Invoice number control + the “Multiple selection” button
+    Const FULL_BELNR_FIELD As String = _
+      "wnd[0]/usr/tabsTABSTRIP_ENTRY/tabpUCOMM_HD/ssub%_SUBSCREEN_ENTRY:Z1140100:1400/txtS_BELNRH-LOW"
+    Const SUF_BELNR_FIELD  As String = "txtS_BELNRH-LOW"
+    Const SUF_BELNR_MULTI_BTN As String = "%_S_BELNRH_%_APP_%-VALU_PUSH"
+
+    ' General (Print/Export) tab controls
+    Const FULL_PRINT_ARCHIVE As String = _
+      "wnd[0]/usr/tabsTABSTRIP_ENTRY/tabpUCOMM_PR/ssub%_SUBSCREEN_ENTRY:Z1140100:2000/chkX_ARCD"
+    Const SUF_PRINT_ARCHIVE  As String = "chkX_ARCD"
+
+    Const FULL_PRINT_OUTDIR As String = _
+      "wnd[0]/usr/tabsTABSTRIP_ENTRY/tabpUCOMM_PR/ssub%_SUBSCREEN_ENTRY:Z1140100:2000/ctxtP_FILOUT"
+    Const SUF_PRINT_OUTDIR  As String = "ctxtP_FILOUT"
+
+    ' ================== MAIN STEPS ==================
+
+    ' -- 1) Switch to "Doc.head" tab (by suffix under the known tabstrip) --
+    If Not SapSelectTabByIdSuffixUnder(sess, TABSTRIP_ROOT, TAB_DOC_HEAD) Then _
+        Err.Raise vbObjectError + 110, , "Could not select 'Doc.head' tab."
+
+    ' -- 2) Turn on “Include Header” and set Company Code (dept) --
+    ' Set checkbox using suffix (fast). If that fails, try the full ID.
+    If Not SapSetCheckboxByIdSuffix(sess, SUF_HDR_CHECK_INCLUDE, True) Then
+        On Error Resume Next
+        sess.findById(FULL_HDR_CHECK_INCLUDE).Selected = True
+        On Error GoTo 0
+    End If
+
+    ' Try full ID first (fast), then suffix fallback. Fails with a clean message.
+    If Not SapSetTextFast(sess, FULL_BUKRS_FIELD, SUF_BUKRS_FIELD, dept) Then _
+        Err.Raise vbObjectError + 201, , "Company Code field not found."
+
+    ' -- 3) Invoice input strategy --
+    If Len(inv) = 0 Then
+        ' Case A: Cell is blank → Use Clipboard via Multiple-Selection popup
+        If Not SapPressButtonByIdSuffix(sess, SUF_BELNR_MULTI_BTN) Then _
+            Err.Raise vbObjectError + 202, , "Multiselect button not found."
+
+        ' “Paste” (btn[24]) in the Multi-Selection popup, then OK (btn[8]).
+        Dim tbl As String, firstCellText As String
+        tbl = "wnd[1]/usr/tabsTAB_STRIP/tabpSIVA/ssubSCREEN_HEADER:SAPLALDB:3010/tblSAPLALDBSINGLE"
+        On Error Resume Next
+        sess.findById("wnd[1]/tbar[0]/btn[24]").press   ' Paste
+        firstCellText = sess.findById(tbl & "/txtRSCSEL_255-SLOW_I[1,0]").Text
+        On Error GoTo 0
+        If Len(Trim$(firstCellText)) = 0 Then _
+            Err.Raise vbObjectError + 203, , "Clipboard appears empty."
+        sess.findById("wnd[1]/tbar[0]/btn[8]").press    ' OK
+
+    ElseIf InStr(1, inv, "/", vbTextCompare) > 0 Then
+        ' Case B: A slash-separated list (e.g., "A/B/C") → feed Multi-Select table.
+        EnterInvoice_Multi sess, inv, SUF_BELNR_MULTI_BTN
+
+    Else
+        ' Case C: A single invoice → set S_BELNRH-LOW directly.
+        If Not SapSetTextFast(sess, FULL_BELNR_FIELD, SUF_BELNR_FIELD, inv) Then _
+            Err.Raise vbObjectError + 204, , "Invoice field not found."
+    End If
+
+    ' -- 4) Switch to "General" tab and set output options --
+    If Not SapSelectTabByIdSuffixUnder(sess, TABSTRIP_ROOT, TAB_GENERAL) Then _
+        Err.Raise vbObjectError + 120, , "Could not select 'General' tab."
+
+    ' Archive checkbox (suffix → fullID fallback)
+    If Not SapSetCheckboxByIdSuffix(sess, SUF_PRINT_ARCHIVE, True) Then
+        On Error Resume Next
+        sess.findById(FULL_PRINT_ARCHIVE).Selected = True
+        On Error GoTo 0
+    End If
+
+    ' Output directory (fullID → suffix fallback)
+    If Not SapSetTextFast(sess, FULL_PRINT_OUTDIR, SUF_PRINT_OUTDIR, outDir) Then _
+        Err.Raise vbObjectError + 205, , "Output folder field not found."
+
+    ' -- 5) Execute (F8) --
+    ' This triggers the SAP report/export in the current transaction.
+    sess.findById("wnd[0]/tbar[1]/btn[8]").press
+
+    MsgBox "Invoice download has finished.", vbInformation
+
+Cleanup:
+    SpeedGuard False
+    Exit Sub
+
+EH:
+    SpeedGuard False
+    MsgBox "Invoice download failed: " & Err.Description, vbExclamation, "SAP Downloader"
+End Sub
+
+' -----------------------------------------------------------------------------
+' EnterInvoice_Multi(sess, invJoined, btnSuffix)
+' Purpose:
+'   Writes **multiple** invoice numbers into SAP’s “Multiple selection” popup.
+'
+' Parameters:
+'   sess        : The SAP session object returned by SapGetSessionByTCode.
+'   invJoined   : A single string of invoices separated by “/”
+'                 e.g., "5100001234/5100001235/5100001236".
+'   btnSuffix   : TechID suffix of the specific “Multiple selection” button
+'                 for the target field (here: %_S_BELNRH_%_APP_%-VALU_PUSH).
+'
+' How it works:
+'   - Presses the multiselect button (by suffix).
+'   - Locates the standard ALV single-column selection table in the popup.
+'   - Clears only the rows it needs, then writes each invoice into its row.
+'   - Confirms with OK (btn[8]).
+' -----------------------------------------------------------------------------
+Private Sub EnterInvoice_Multi(ByVal sess As Object, ByVal invJoined As String, ByVal btnSuffix As String)
+    Dim arr() As String, i As Long, n As Long, tbl As String, cell As String
+
+    SapPressButtonByIdSuffix sess, btnSuffix
+
+    ' Standard path for the ALV single-column selection table used by many SAP screens.
+    tbl = "wnd[1]/usr/tabsTAB_STRIP/tabpSIVA/ssubSCREEN_HEADER:SAPLALDB:3010/tblSAPLALDBSINGLE"
+
+    ' Split the "A/B/C" string into an array of invoice numbers.
+    arr = Split(CStr(invJoined), "/")
+    n = UBound(arr)
+
+    On Error Resume Next
+    ' First clear the exact number of rows we will fill (defensive; avoids stale entries).
+    For i = 0 To n
+        cell = tbl & "/txtRSCSEL_255-SLOW_I[1," & i & "]"
+        sess.findById(cell).Text = ""
+    Next i
+
+    ' Then write each invoice to the LOW column (index 1) row-by-row.
+    For i = 0 To n
+        cell = tbl & "/txtRSCSEL_255-SLOW_I[1," & i & "]"
+        sess.findById(cell).Text = Trim$(arr(i))
+    Next i
+    On Error GoTo 0
+
+    ' Confirm the selection to return values to the selection screen.
+    sess.findById("wnd[1]/tbar[0]/btn[8]").press ' OK
+End Sub
+
+' -----------------------------------------------------------------------------
+' MkDirsSafe(path)
+' Purpose:
+'   Creates a folder path if it doesn’t exist, safely handling both:
+'     - Drive-based paths (e.g., "D:\Exports\Invoices\2025")
+'     - UNC network paths (e.g., "\\server\share\folder")
+'
+' Behavior:
+'   - Walks each segment of the path and creates it only if missing.
+'   - Ignores empty segments like accidental double backslashes.
+' -----------------------------------------------------------------------------
+Private Sub MkDirsSafe(ByVal p As String)
+    On Error Resume Next
+    If Len(Dir(p, vbDirectory)) > 0 Then Exit Sub
+
+    Dim parts() As String, i As Long, cur As String
+    parts = Split(Replace(p, "/", "\"), "\")
+
+    If Left$(p, 2) = "\\" Then
+        ' UNC root: \\server\share
+        cur = "\\" & parts(2) & "\" & parts(3): i = 4
+    Else
+        ' Drive root: D: or C:
+        cur = parts(0): i = 1
+    End If
+
+    For i = i To UBound(parts)
+        If Len(parts(i)) = 0 Then GoTo NextPart
+        cur = cur & "\" & parts(i)
+        If Len(Dir(cur, vbDirectory)) = 0 Then MkDir cur
+NextPart:
+    Next i
+End Sub
+
+
