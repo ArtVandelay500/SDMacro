@@ -1,0 +1,293 @@
+Option Explicit
+' ============================================================================
+' MIRO paste with boundary paging (reliable on 0..7 visible row layouts)
+' - Uses your old session helpers
+' - Absolute k -> localRow (0..pageRows-1)
+' - Page transition via PgDn when crossing page boundary
+' ============================================================================
+
+' ===== Target selection =====
+Private Const SYSTEM_PREFIX      As String = "P32"
+Private Const CLIENT_EXACT       As String = "030"
+Private Const TARGET_TCODE       As String = "MIRO"
+Private Const RESET_ON_REUSE     As Boolean = False   ' /nMIRO on reuse if True
+
+' ===== Excel layout =====
+Private Const XL_SHEET           As String = "POitem"
+Private Const XL_FIRST_ROW       As Long = 2
+Private Const MAX_ROWS           As Long = 9999
+Private Const XL_COL_WRBTR       As String = "A"      ' Amount
+Private Const XL_COL_MENGE       As String = "B"      ' Qty ("" to skip)
+Private Const XL_COL_EBELP       As String = "C"      ' Item number (validation)
+
+' ===== MIRO table IDs (recorder paths) =====
+Private Const TBL_6006 As String = _
+ "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6006/subITEMS:SAPLMR1M:6010/" & _
+ "tabsITEMTAB/tabpITEMS_PO/ssubTABS:SAPLMR1M:6020/subITEM:SAPLMR1M:6310/tblSAPLMR1MTC_MR1M"
+Private Const TBL_6005 As String = _
+ "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/subITEMS:SAPLMR1M:6010/" & _
+ "tabsITEMTAB/tabpITEMS_PO/ssubTABS:SAPLMR1M:6020/subITEM:SAPLMR1M:6310/tblSAPLMR1MTC_MR1M"
+
+' ===== Field bases & column indices (0-based) =====
+Private Const COL_EBELP As Long = 8   ' DRSEG-EBELP
+Private Const COL_WRBTR As Long = 3   ' DRSEG-WRBTR
+Private Const COL_MENGE As Long = 4   ' DRSEG-MENGE
+Private Const F_EBELP   As String = "DRSEG-EBELP"
+Private Const F_WRBTR   As String = "DRSEG-WRBTR"
+Private Const F_MENGE   As String = "DRSEG-MENGE"
+
+' ===== Behavior =====
+Private Const STOP_ON_MISMATCH    As Boolean = True
+Private Const PRESS_ENTER_AFTER_FOCUS As Boolean = False
+
+' Visible rows per page (fallback if SAP reports weird values)
+Private Const PAGE_ROWS_FALLBACK  As Long = 8
+
+' Key codes
+Private Const VKEY_ENTER As Long = 0
+Private Const VKEY_PGDN  As Long = 82
+Private Const VKEY_PGUP  As Long = 81
+
+' Small timing
+Private Const SLEEP_SHORT_MS As Long = 20
+
+' ===== State =====
+Private gTblId As String
+
+' ============================================================================
+' Entry
+' ============================================================================
+Public Sub Paste_MIRO_BoundaryPaging()
+    Dim ses As Object
+    Set ses = SapGetExistingSessionOnTCode(SYSTEM_PREFIX, CLIENT_EXACT, TARGET_TCODE, RESET_ON_REUSE)
+    If ses Is Nothing Then
+        MsgBox "Open MIRO first (" & SYSTEM_PREFIX & "/" & CLIENT_EXACT & ").", vbExclamation
+        Exit Sub
+    End If
+    If Not SapAssertOnTCode_NoReset(ses, TARGET_TCODE) Then
+        MsgBox "Not on MIRO.", vbCritical
+        Exit Sub
+    End If
+
+    If Not EnsureMiroTableId_OldStyle(ses) Then
+        MsgBox "MIRO items table not found (6006/6005).", vbCritical
+        Exit Sub
+    End If
+
+    Dim tbl As Object: Set tbl = ses.findById(gTblId)
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(XL_SHEET)
+
+    Dim pageRows As Long: pageRows = GetPageRows(tbl)
+    If pageRows <= 0 Then pageRows = PAGE_ROWS_FALLBACK
+
+    Dim k As Long, r As Long, localRow As Long
+    Dim vAmt As Variant, vQty As Variant, vItm As Variant
+    Dim expE As String, sapE As String
+
+    For k = 0 To MAX_ROWS - 1
+        r = XL_FIRST_ROW + k
+
+        vAmt = ReadCell(ws, XL_COL_WRBTR, r)
+        vQty = IIf(LenB(XL_COL_MENGE) > 0, ReadCell(ws, XL_COL_MENGE, r), "")
+        vItm = ReadCell(ws, XL_COL_EBELP, r)
+
+        ' stop when we hit a fully blank row
+        If IsEmptyLike(vAmt) And (LenB(XL_COL_MENGE) = 0 Or IsEmptyLike(vQty)) And IsEmptyLike(vItm) Then Exit For
+
+        ' compute local row in current page
+        localRow = k Mod pageRows
+
+        ' ===== page transition: when localRow = 0 (and not first row), PageDown once
+        If (k > 0) And (localRow = 0) Then
+            ' Commit any pending editor text so PgDn is taken
+            On Error Resume Next
+            'ses.findById("wnd[0]").sendVKey VKEY_ENTER
+            DoEvents
+
+            ' Focus last visible row to ensure the grid consumes PgDn
+            FocusCell ses, F_EBELP, COL_EBELP, pageRows - 1
+            DoEvents
+
+            ' Page down exactly one slate
+            ses.findById("wnd[0]").sendVKey VKEY_PGDN
+            DoEvents: SleepMs SLEEP_SHORT_MS
+        End If
+
+        ' ===== validate EBELP on this local row
+        FocusCell ses, F_EBELP, COL_EBELP, localRow
+        If PRESS_ENTER_AFTER_FOCUS Then On Error Resume Next: ses.findById("wnd[0]").sendVKey VKEY_ENTER: On Error GoTo 0
+
+        expE = PadEbelp5(CStr(vItm))
+        sapE = ReadTxtOrCtxt(ses, gTblId, F_EBELP, COL_EBELP, localRow)
+        sapE = PadEbelp5(sapE)
+
+        If Len(expE) > 0 And StrComp(expE, sapE, vbTextCompare) <> 0 Then
+            If STOP_ON_MISMATCH Then
+                MsgBox "EBELP mismatch at Excel row " & r & vbCrLf & _
+                       "Expected: " & expE & vbCrLf & "SAP: " & sapE & vbCrLf & _
+                       "(k=" & k & ", localRow=" & localRow & ", pageRows=" & pageRows & ")", vbCritical
+                Exit Sub
+            Else
+                Debug.Print "WARN: r=" & r & " exp=" & expE & " sap=" & sapE
+            End If
+        End If
+
+        ' ===== paste WRBTR / MENGE at same local row
+        If Not IsEmptyLike(vAmt) Then
+            SafeSetTxt ses, gTblId, F_WRBTR, COL_WRBTR, localRow, ToSapAmount(vAmt)
+            SleepMs SLEEP_SHORT_MS
+        End If
+        If LenB(XL_COL_MENGE) > 0 And Not IsEmptyLike(vQty) Then
+            SafeSetTxt ses, gTblId, F_MENGE, COL_MENGE, localRow, ToSapQty(vQty)
+            SleepMs SLEEP_SHORT_MS
+        End If
+    Next k
+
+    MsgBox "Done. Last Excel row pasted: " & (r - 1) & ".", vbInformation
+End Sub
+
+' ============================================================================
+' --- Old session helpers (your originals) ---
+' ============================================================================
+Private Function SapGetApp() As Object
+    On Error Resume Next
+    Dim gui As Object: Set gui = GetObject("SAPGUI")
+    If Err.Number <> 0 Or gui Is Nothing Then Exit Function
+    Set SapGetApp = gui.GetScriptingEngine
+End Function
+
+Private Function SapGetExistingSessionOnTCode(ByVal systemPrefix As String, _
+                                              ByVal clientExact As String, _
+                                              ByVal tcode As String, _
+                                              ByVal resetOnFound As Boolean) As Object
+    On Error Resume Next
+    Dim app As Object: Set app = SapGetApp()
+    If app Is Nothing Then Exit Function
+    Dim con As Object, ses As Object
+    For Each con In app.Connections
+        For Each ses In con.Sessions
+            Dim ok As Boolean: ok = True
+            If Len(systemPrefix) > 0 Then ok = ok And (Left$(ses.Info.SystemName, Len(systemPrefix)) = systemPrefix)
+            If Len(clientExact) > 0 Then ok = ok And (ses.Info.Client = clientExact)
+            ok = ok And (UCase$(ses.Info.Transaction) = UCase$(tcode))
+            If ok Then
+                If resetOnFound Then On Error Resume Next: ses.SendCommand "/n" & tcode: On Error GoTo 0
+                Set SapGetExistingSessionOnTCode = ses: Exit Function
+            End If
+        Next ses
+    Next con
+End Function
+
+Private Function SapAssertOnTCode_NoReset(ByVal ses As Object, ByVal tcode As String) As Boolean
+    On Error Resume Next
+    SapAssertOnTCode_NoReset = (UCase$(CStr(ses.Info.Transaction)) = UCase$(tcode))
+End Function
+
+' ============================================================================
+' Table/editor helpers (recorder-style)
+' ============================================================================
+Private Function EnsureMiroTableId_OldStyle(ByVal ses As Object) As Boolean
+    On Error Resume Next
+    Dim o As Object
+    Set o = ses.findById(TBL_6006)
+    If Err.Number = 0 Then gTblId = TBL_6006: EnsureMiroTableId_OldStyle = True: Exit Function
+    Err.Clear
+    Set o = ses.findById(TBL_6005)
+    If Err.Number = 0 Then gTblId = TBL_6005: EnsureMiroTableId_OldStyle = True: Exit Function
+    Err.Clear
+End Function
+
+Private Sub FocusCell(ByVal ses As Object, ByVal fieldBase As String, ByVal colIdx As Long, ByVal localRow As Long)
+    On Error Resume Next
+    Dim id As String
+    id = gTblId & "/txt" & fieldBase & "[" & colIdx & "," & localRow & "]"
+    ses.findById(id).SetFocus
+    If Err.Number = 0 Then ses.findById(id).CaretPosition = 1: Exit Sub
+    Err.Clear
+    id = gTblId & "/ctxt" & fieldBase & "[" & colIdx & "," & localRow & "]"
+    ses.findById(id).SetFocus
+    If Err.Number = 0 Then ses.findById(id).CaretPosition = 1
+    Err.Clear
+End Sub
+
+Private Function ReadTxtOrCtxt(ByVal ses As Object, ByVal tblId As String, ByVal fieldBase As String, _
+                               ByVal colIdx As Long, ByVal localRow As Long) As String
+    On Error Resume Next
+    Dim id As String, t As String
+    id = tblId & "/txt" & fieldBase & "[" & colIdx & "," & localRow & "]"
+    t = CStr(ses.findById(id).Text)
+    If Err.Number = 0 And LenB(t) > 0 Then ReadTxtOrCtxt = Trim$(t): Exit Function
+    Err.Clear
+    id = tblId & "/ctxt" & fieldBase & "[" & colIdx & "," & localRow & "]"
+    t = CStr(ses.findById(id).Text)
+    If Err.Number = 0 Then ReadTxtOrCtxt = Trim$(t) Else ReadTxtOrCtxt = ""
+End Function
+
+Private Sub SafeSetTxt(ByVal ses As Object, ByVal tblId As String, ByVal fieldBase As String, _
+                       ByVal colIdx As Long, ByVal localRow As Long, ByVal value As String)
+    On Error Resume Next
+    ses.findById(tblId & "/txt" & fieldBase & "[" & colIdx & "," & localRow & "]").Text = value
+    If Err.Number <> 0 Then
+        Err.Clear
+        ses.findById(tblId & "/ctxt" & fieldBase & "[" & colIdx & "," & localRow & "]").Text = value
+    End If
+End Sub
+
+Private Function GetPageRows(ByVal tbl As Object) As Long
+    On Error Resume Next
+    Dim ps As Long
+    ps = CLng(tbl.VerticalScrollbar.pageSize)
+    If ps < 3 Or ps > 50 Then ps = PAGE_ROWS_FALLBACK
+    GetPageRows = ps
+End Function
+
+' ============================================================================
+' Tiny utils
+' ============================================================================
+Private Function ReadCell(ws As Worksheet, col As Variant, ByVal row As Long) As Variant
+    If VarType(col) = vbString Then
+        ReadCell = ws.Range(CStr(col) & CStr(row)).value
+    Else
+        ReadCell = ws.Cells(row, CLng(col)).value
+    End If
+End Function
+
+Private Function IsEmptyLike(v As Variant) As Boolean
+    IsEmptyLike = (IsEmpty(v) Or IsError(v) Or Trim$(CStr(v)) = "")
+End Function
+
+Private Sub SleepMs(ByVal ms As Long)
+    Dim t As Double: t = Timer
+    Do While (Timer - t) * 1000 < ms: DoEvents: Loop
+End Sub
+
+Private Function PadEbelp5(ByVal s As String) As String
+    s = Trim$(s)
+    Dim i As Long, d As String, ch As String
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If ch >= "0" And ch <= "9" Then d = d & ch
+    Next i
+    If Len(d) = 0 Then PadEbelp5 = "" Else PadEbelp5 = Right$("00000" & d, 5)
+End Function
+
+Private Function ToSapAmount(ByVal v As Variant) As String
+    Dim s As String: s = Trim$(CStr(v))
+    If Len(s) = 0 Then ToSapAmount = "": Exit Function
+    s = Replace$(s, Application.ThousandsSeparator, "")
+    s = Replace$(s, Application.DecimalSeparator, ".")
+    ToSapAmount = s
+End Function
+
+Private Function ToSapQty(ByVal v As Variant) As String
+    If IsNumeric(v) Then
+        ToSapQty = Replace$(Format$(CDbl(v), "0.000"), Application.DecimalSeparator, ".")
+    Else
+        Dim s As String: s = Trim$(CStr(v))
+        s = Replace$(s, Application.ThousandsSeparator, "")
+        s = Replace$(s, Application.DecimalSeparator, ".")
+        ToSapQty = s
+    End If
+End Function
+
+
