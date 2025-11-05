@@ -1,0 +1,502 @@
+Option Explicit
+' ============================================================================
+' MIRO two-phase mass pasting (robust, recorder-compatible)
+' Step 1: Open Select-IDs popup (btnRM08M-XMSEL)
+' Step 2: Paste EBELN/EBELP into popup (8 rows per page) with verified paging
+' Step 3: Confirm popup (Adopt)
+' Step 4: Paste WRBTR/MENGE into main grid (17 rows per page) with verified paging
+' Notes:
+'   - No ENTER presses required
+'   - Uses deterministic scrollbar paging with read-back verification
+'   - Reads from Excel sheet columns: A(EBELN) B(EBELP) C(WRBTR) D(MENGE)
+' ============================================================================
+
+' ====== Session / Landscape selectors ======
+Private Const SYSTEM_PREFIX      As String = "P32"
+Private Const CLIENT_EXACT       As String = "030"
+Private Const TARGET_TCODE       As String = "MIRO"
+Private Const RESET_ON_REUSE     As Boolean = False
+
+' ====== Excel layout ======
+Private Const XL_SHEET           As String = "STOCK"
+Private Const XL_FIRST_ROW       As Long = 2
+Private Const COL_EBELN          As String = "A"
+Private Const COL_EBELP          As String = "B"
+Private Const COL_WRBTR          As String = "C"
+Private Const COL_MENGE          As String = "D"
+
+' ====== “Select IDs” button (two variants) ======
+Private Const BTN_OPEN_ID_6006 As String = _
+ "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6006/subITEMS:SAPLMR1M:6010/" & _
+ "tabsITEMTAB/tabpITEMS_PO/ssubTABS:SAPLMR1M:6020/subREFERENZBELEG:SAPLMR1M:6211/btnRM08M-XMSEL"
+Private Const BTN_OPEN_ID_6005 As String = _
+ "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/subITEMS:SAPLMR1M:6010/" & _
+ "tabsITEMTAB/tabpITEMS_PO/ssubTABS:SAPLMR1M:6020/subREFERENZBELEG:SAPLMR1M:6211/btnRM08M-XMSEL"
+
+' ====== Popup table (wnd[1]) ======
+Private Const POP_TBL_ID As String = _
+ "wnd[1]/usr/subMSEL:SAPLMR1M:6221/tblSAPLMR1MTC_MSEL_BEST"
+Private Const POP_COL_EBELN As Long = 0       ' ctxtRM08M-EBELN[0,row]
+Private Const POP_COL_EBELP As Long = 1       ' txtRM08M-EBELP[1,row]
+Private Const POP_PAGE_ROWS As Long = 8
+Private Const POP_BTN_CONFIRM As String = "wnd[1]/tbar[0]/btn[8]"  ' Adopt
+
+' ====== Main MIRO table (wnd[0]) ======
+Private Const MAIN_TBL_6006 As String = _
+ "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6006/subITEMS:SAPLMR1M:6010/" & _
+ "tabsITEMTAB/tabpITEMS_PO/ssubTABS:SAPLMR1M:6020/subITEM:SAPLMR1M:6310/tblSAPLMR1MTC_MR1M"
+Private Const MAIN_TBL_6005 As String = _
+ "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/subITEMS:SAPLMR1M:6010/" & _
+ "tabsITEMTAB/tabpITEMS_PO/ssubTABS:SAPLMR1M:6020/subITEM:SAPLMR1M:6310/tblSAPLMR1MTC_MR1M"
+
+' Main fields (0-based column indices)
+Private Const MAIN_COL_EBELP As Long = 8      ' DRSEG-EBELP (for focusing)
+Private Const MAIN_COL_WRBTR As Long = 3      ' DRSEG-WRBTR
+Private Const MAIN_COL_MENGE As Long = 4      ' DRSEG-MENGE
+Private Const F_EBELP        As String = "DRSEG-EBELP"
+Private Const F_WRBTR        As String = "DRSEG-WRBTR"
+Private Const F_MENGE        As String = "DRSEG-MENGE"
+Private Const MAIN_PAGE_ROWS As Long = 17
+
+' Keys / timing
+Private Const VKEY_PGDN      As Long = 82
+Private Const SLEEP_MS       As Long = 20
+
+' State
+Private gMainTblId As String
+
+' ============================================================================
+' Public entry
+' ============================================================================
+Public Sub MIRO_TwoPhase_Paste_FromSheet()
+    Dim ses As Object
+    Set ses = SapGetExistingSessionOnTCode(SYSTEM_PREFIX, CLIENT_EXACT, TARGET_TCODE, RESET_ON_REUSE)
+    If ses Is Nothing Then MsgBox "Open MIRO (" & SYSTEM_PREFIX & "/" & CLIENT_EXACT & ") first.", vbExclamation: Exit Sub
+    If Not SapAssertOnTCode_NoReset(ses, TARGET_TCODE) Then MsgBox "Not on MIRO.", vbCritical: Exit Sub
+
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(XL_SHEET)
+
+    ' Count how many ID rows to load (A/B)
+    Dim totalIDs As Long: totalIDs = CountRowsPair(ws, XL_FIRST_ROW, COL_EBELN, COL_EBELP)
+    If totalIDs <= 0 Then MsgBox "No EBELN/EBELP found in Excel (cols A/B).", vbExclamation: Exit Sub
+
+    ' --- Step 1: open popup
+    If Not PressSelectIDsButton(ses) Then
+        MsgBox "Could not find 'Select IDs' button (6006/6005).", vbCritical
+        Exit Sub
+    End If
+
+    ' --- Step 2: paste IDs into popup with boundary paging
+    Paste_Popup_IDs ses, ws, totalIDs
+
+    ' --- Step 3: confirm popup
+    On Error Resume Next
+    ses.findById(POP_BTN_CONFIRM).press
+    On Error GoTo 0
+    SleepMs SLEEP_MS
+
+    ' --- Step 4: paste WRBTR/MENGE into main grid
+    Dim totalMain As Long
+    totalMain = CountRowsUpTo(ws, XL_FIRST_ROW, COL_WRBTR, COL_MENGE, totalIDs) ' don’t exceed IDs loaded
+
+    Dim pasted As Long
+    pasted = Paste_Main_WRBTR_MENGE(ses, ws, totalMain)
+
+    MsgBox "IDs loaded: " & totalIDs & vbCrLf & _
+           "Amounts/Qty pasted: " & pasted, vbInformation
+End Sub
+
+' ============================================================================
+' Step 1: open Select-IDs popup
+' ============================================================================
+Private Function PressSelectIDsButton(ByVal ses As Object) As Boolean
+    On Error Resume Next
+    ses.findById(BTN_OPEN_ID_6006).press
+    If Err.Number = 0 Then PressSelectIDsButton = True: Err.Clear: Exit Function
+    Err.Clear
+    ses.findById(BTN_OPEN_ID_6005).press
+    If Err.Number = 0 Then PressSelectIDsButton = True
+    Err.Clear
+End Function
+
+' ============================================================================
+' Step 2: popup paste (8 per page) with verified paging
+' ============================================================================
+Private Sub Paste_Popup_IDs(ByVal ses As Object, ByVal ws As Worksheet, ByVal totalIDs As Long)
+    ' Give the grid the focus first (helps PgDn consumption)
+    FocusPopupRow ses, POP_PAGE_ROWS - 1
+
+    Dim k As Long, r As Long, localRow As Long
+    Dim vEBELN As Variant, vEBELP As Variant
+
+    For k = 0 To totalIDs - 1
+        r = XL_FIRST_ROW + k
+        vEBELN = ReadCell(ws, COL_EBELN, r)
+        vEBELP = ReadCell(ws, COL_EBELP, r)
+
+        localRow = (k Mod POP_PAGE_ROWS) ' 0..7
+
+        If (k > 0) And (localRow = 0) Then
+            ' Move exactly one slate down (prefer scrollbar jump with verification)
+            PageDown_Deterministic ses, POP_TBL_ID, POP_PAGE_ROWS, VKEY_PGDN, "wnd[1]"
+            DoEvents: SleepMs SLEEP_MS
+            FocusPopupRow ses, POP_PAGE_ROWS - 1
+        End If
+
+        Popup_SetText ses, "ctxtRM08M-EBELN", POP_COL_EBELN, localRow, Trim$(CStr(vEBELN))
+        Popup_SetText ses, "txtRM08M-EBELP", POP_COL_EBELP, localRow, Trim$(CStr(vEBELP))
+    Next k
+End Sub
+
+Private Sub FocusPopupRow(ByVal ses As Object, ByVal localRow As Long)
+    On Error Resume Next
+    Dim id As String
+    id = POP_TBL_ID & "/ctxtRM08M-EBELN[" & POP_COL_EBELN & "," & localRow & "]"
+    ses.findById(id).SetFocus
+    If Err.Number = 0 Then ses.findById(id).CaretPosition = 1: Err.Clear: Exit Sub
+    Err.Clear
+    id = POP_TBL_ID & "/txtRM08M-EBELP[" & POP_COL_EBELP & "," & localRow & "]"
+    ses.findById(id).SetFocus
+    If Err.Number = 0 Then ses.findById(id).CaretPosition = 1
+    Err.Clear
+End Sub
+
+Private Sub Popup_SetText(ByVal ses As Object, ByVal fieldBase As String, _
+                          ByVal colIdx As Long, ByVal localRow As Long, ByVal value As String)
+    On Error Resume Next
+    Dim id As String
+    id = POP_TBL_ID & "/" & fieldBase & "[" & colIdx & "," & localRow & "]"
+    ses.findById(id).Text = value
+    Err.Clear
+End Sub
+
+' ============================================================================
+' Step 4: main paste (17 per page) with verified paging
+' ============================================================================
+Private Function Paste_Main_WRBTR_MENGE(ByVal ses As Object, ByVal ws As Worksheet, ByVal totalRows As Long) As Long
+    If Not EnsureMainTableId(ses) Then Exit Function
+
+    ' (1) Use real visible rows per page (fallback to your constant if SAP reports odd values)
+    Dim pageRows As Long
+    pageRows = GetMainPageRows(ses, gMainTblId, MAIN_PAGE_ROWS)  ' e.g., usually 16, not 17
+
+    ' (2) Make sure PgDn is consumed by the GRID (not the inline editor)
+    FocusMainCell ses, F_EBELP, MAIN_COL_EBELP, pageRows - 1
+
+    ' Track the current top-of-page key so we can *verify* a slate change after PgDn
+    Dim topKey As String
+    topKey = ReadTxtOrCtxt(ses, gMainTblId, F_EBELP, MAIN_COL_EBELP, 0)
+
+    Dim pasted As Long
+    Dim k As Long, r As Long, localRow As Long
+    Dim vAmt As Variant, vQty As Variant
+
+    For k = 0 To totalRows - 1
+        r = XL_FIRST_ROW + k
+        vAmt = ReadCell(ws, COL_WRBTR, r)
+        vQty = ReadCell(ws, COL_MENGE, r)
+
+        localRow = (k Mod pageRows)
+
+        ' (3) Boundary paging: on first row of each slate, PgDn and *verify* top EBELP changed
+        If (k > 0) And (localRow = 0) Then
+            ' Focus last visible row so the TABLE (not the cell editor) eats PgDn
+            FocusMainCell ses, F_EBELP, MAIN_COL_EBELP, pageRows - 1
+
+            ' Key-only page down (no scrollbar writes)
+            ses.findById("wnd[0]").sendVKey VKEY_PGDN
+            DoEvents: SleepMs SLEEP_MS
+
+            ' Wait for the new slate (top EBELP must differ from last slate’s)
+            If Not WaitTopRowChanged_EBELP(ses, gMainTblId, MAIN_COL_EBELP, topKey, 900) Then
+                ' If the slate didn’t change, try one more PgDn once
+                ses.findById("wnd[0]").sendVKey VKEY_PGDN
+                DoEvents: SleepMs (SLEEP_MS + 20)
+                Call WaitTopRowChanged_EBELP(ses, gMainTblId, MAIN_COL_EBELP, topKey, 900)
+            End If
+            topKey = ReadTxtOrCtxt(ses, gMainTblId, F_EBELP, MAIN_COL_EBELP, 0)
+
+            ' Keep bottom focus for the next PgDn
+            FocusMainCell ses, F_EBELP, MAIN_COL_EBELP, pageRows - 1
+        End If
+
+        ' (4) PRIME editor on the exact row/cell we’re about to write, then write + quick read-back
+        If Not IsEmptyLike(vAmt) Then
+            FocusMainCell ses, F_WRBTR, MAIN_COL_WRBTR, localRow
+            DoEvents
+            SafeSetTxt ses, gMainTblId, F_WRBTR, MAIN_COL_WRBTR, localRow, ToSapAmount(vAmt)
+            ' Light verify; SAP may reformat, so we check digits/decimal loosely
+            If Not VerifyLooseEqual(ToSapAmount(vAmt), ReadTxtOrCtxt(ses, gMainTblId, F_WRBTR, MAIN_COL_WRBTR, localRow)) Then
+                ' one re-touch on the same cell if needed
+                FocusMainCell ses, F_WRBTR, MAIN_COL_WRBTR, localRow
+                DoEvents: SleepMs 10
+                SafeSetTxt ses, gMainTblId, F_WRBTR, MAIN_COL_WRBTR, localRow, ToSapAmount(vAmt)
+            End If
+        End If
+
+        If Not IsEmptyLike(vQty) Then
+            FocusMainCell ses, F_MENGE, MAIN_COL_MENGE, localRow
+            DoEvents
+            SafeSetTxt ses, gMainTblId, F_MENGE, MAIN_COL_MENGE, localRow, ToSapQty(vQty)
+            If Not VerifyLooseEqual(ToSapQty(vQty), ReadTxtOrCtxt(ses, gMainTblId, F_MENGE, MAIN_COL_MENGE, localRow)) Then
+                FocusMainCell ses, F_MENGE, MAIN_COL_MENGE, localRow
+                DoEvents: SleepMs 10
+                SafeSetTxt ses, gMainTblId, F_MENGE, MAIN_COL_MENGE, localRow, ToSapQty(vQty)
+            End If
+        End If
+
+        pasted = pasted + 1
+    Next k
+
+    Paste_Main_WRBTR_MENGE = pasted
+End Function
+
+
+
+
+
+' ============================================================================
+' Session helpers (reuse-safe)
+' ============================================================================
+Private Function SapGetApp() As Object
+    On Error Resume Next
+    Dim gui As Object: Set gui = GetObject("SAPGUI")
+    If Err.Number = 0 And Not gui Is Nothing Then Set SapGetApp = gui.GetScriptingEngine
+    Err.Clear
+End Function
+
+Private Function SapGetExistingSessionOnTCode(ByVal systemPrefix As String, _
+                                              ByVal clientExact As String, _
+                                              ByVal tcode As String, _
+                                              ByVal resetOnFound As Boolean) As Object
+    On Error Resume Next
+    Dim app As Object: Set app = SapGetApp()
+    If app Is Nothing Then Exit Function
+
+    Dim con As Object, ses As Object
+    For Each con In app.Connections
+        For Each ses In con.Sessions
+            Dim ok As Boolean: ok = True
+            If Len(systemPrefix) > 0 Then ok = ok And (Left$(ses.Info.SystemName, Len(systemPrefix)) = systemPrefix)
+            If Len(clientExact) > 0 Then ok = ok And (ses.Info.Client = clientExact)
+            ok = ok And (UCase$(ses.Info.Transaction) = UCase$(tcode))
+            If ok Then
+                If resetOnFound Then ses.SendCommand "/n" & tcode
+                Set SapGetExistingSessionOnTCode = ses
+                Exit Function
+            End If
+        Next ses
+    Next con
+End Function
+
+Private Function SapAssertOnTCode_NoReset(ByVal ses As Object, ByVal tcode As String) As Boolean
+    On Error Resume Next
+    SapAssertOnTCode_NoReset = (UCase$(CStr(ses.Info.Transaction)) = UCase$(tcode))
+End Function
+
+' ============================================================================
+' Main table helpers
+' ============================================================================
+Private Function EnsureMainTableId(ByVal ses As Object) As Boolean
+    On Error Resume Next
+    Dim o As Object
+    Set o = ses.findById(MAIN_TBL_6006)
+    If Err.Number = 0 Then gMainTblId = MAIN_TBL_6006: EnsureMainTableId = True: Err.Clear: Exit Function
+    Err.Clear
+    Set o = ses.findById(MAIN_TBL_6005)
+    If Err.Number = 0 Then gMainTblId = MAIN_TBL_6005: EnsureMainTableId = True
+    Err.Clear
+End Function
+
+Private Sub FocusMainCell(ByVal ses As Object, ByVal fieldBase As String, ByVal colIdx As Long, ByVal localRow As Long)
+    On Error Resume Next
+    Dim id As String
+    id = gMainTblId & "/txt" & fieldBase & "[" & colIdx & "," & localRow & "]"
+    ses.findById(id).SetFocus
+    If Err.Number = 0 Then ses.findById(id).CaretPosition = 1: Err.Clear: Exit Sub
+    Err.Clear
+    id = gMainTblId & "/ctxt" & fieldBase & "[" & colIdx & "," & localRow & "]"
+    ses.findById(id).SetFocus
+    If Err.Number = 0 Then ses.findById(id).CaretPosition = 1
+    Err.Clear
+End Sub
+
+Private Sub SafeSetTxt(ByVal ses As Object, ByVal tblId As String, ByVal fieldBase As String, _
+                       ByVal colIdx As Long, ByVal localRow As Long, ByVal value As String)
+    On Error Resume Next
+    ses.findById(tblId & "/txt" & fieldBase & "[" & colIdx & "," & localRow & "]").Text = value
+    If Err.Number <> 0 Then
+        Err.Clear
+        ses.findById(tblId & "/ctxt" & fieldBase & "[" & colIdx & "," & localRow & "]").Text = value
+    End If
+End Sub
+
+' ============================================================================
+' Deterministic one-page scrolling (verified)
+' ============================================================================
+Private Sub PageDown_Deterministic( _
+    ByVal ses As Object, _
+    ByVal tableId As String, _
+    ByVal fallbackPageRows As Long, _
+    ByVal vkeyPgDn As Long, _
+    Optional ByVal wndId As String = "wnd[0]" _
+)
+    On Error Resume Next
+
+    Dim tbl As Object: Set tbl = ses.findById(tableId)
+    If Err.Number <> 0 Then Err.Clear: Exit Sub
+
+    ' Focus the table (not the cell editor) so it owns navigation
+    tbl.SetFocus
+
+    ' Read current scrollbar state
+    Dim startPos As Long, pageRows As Long, maxPos As Long
+    startPos = CLng(tbl.VerticalScrollbar.Position)
+    pageRows = CLng(tbl.VerticalScrollbar.pageSize)
+    If pageRows < 3 Or pageRows > 100 Then pageRows = fallbackPageRows
+    maxPos = CLng(tbl.VerticalScrollbar.Maximum)
+
+    ' Compute target and clamp
+    Dim target As Long: target = startPos + pageRows
+    If target > maxPos Then target = maxPos
+
+    ' Try scrollbar jump
+    tbl.VerticalScrollbar.Position = target
+    DoEvents
+
+    ' Verify movement; if not moved, soft-fallback to vKey PgDn (table → window)
+    If CLng(tbl.VerticalScrollbar.Position) = startPos Then
+        tbl.sendVKey vkeyPgDn
+        DoEvents: SleepMs SLEEP_MS
+
+        If CLng(tbl.VerticalScrollbar.Position) = startPos Then
+            ses.findById(wndId).sendVKey vkeyPgDn
+            DoEvents: SleepMs SLEEP_MS
+        End If
+    End If
+
+    Err.Clear
+End Sub
+
+' ============================================================================
+' Row counting
+' ============================================================================
+Private Function CountRowsPair(ByVal ws As Worksheet, ByVal startRow As Long, _
+                               ByVal col1 As String, ByVal col2 As String) As Long
+    Dim r As Long, last As Long, seen As Boolean
+    For r = startRow To ws.Rows.Count
+        If Trim$(CStr(ws.Range(col1 & r).value)) = "" And Trim$(CStr(ws.Range(col2 & r).value)) = "" Then
+            If seen Then Exit For
+        Else
+            seen = True: last = r
+        End If
+    Next r
+    CountRowsPair = IIf(last >= startRow, last - startRow + 1, 0)
+End Function
+
+Private Function CountRowsUpTo(ByVal ws As Worksheet, ByVal startRow As Long, _
+                               ByVal colA As String, ByVal colB As String, _
+                               ByVal hardLimit As Long) As Long
+    Dim r As Long, last As Long, seen As Boolean, endAt As Long
+    endAt = startRow + hardLimit - 1
+    For r = startRow To endAt
+        If Trim$(CStr(ws.Range(colA & r).value)) = "" And Trim$(CStr(ws.Range(colB & r).value)) = "" Then
+            If seen Then Exit For
+        Else
+            seen = True: last = r
+        End If
+    Next r
+    CountRowsUpTo = IIf(last >= startRow, last - startRow + 1, 0)
+End Function
+
+' ============================================================================
+' Tiny utils
+' ============================================================================
+Private Function ReadCell(ws As Worksheet, col As Variant, ByVal row As Long) As Variant
+    If VarType(col) = vbString Then
+        ReadCell = ws.Range(CStr(col) & CStr(row)).value
+    Else
+        ReadCell = ws.Cells(row, CLng(col)).value
+    End If
+End Function
+
+Private Function IsEmptyLike(v As Variant) As Boolean
+    IsEmptyLike = (IsEmpty(v) Or IsError(v) Or Trim$(CStr(v)) = "")
+End Function
+
+Private Sub SleepMs(ByVal ms As Long)
+    Dim t As Double: t = Timer
+    Do While (Timer - t) * 1000 < ms: DoEvents: Loop
+End Sub
+
+Private Function ToSapAmount(ByVal v As Variant) As String
+    Dim s As String: s = Trim$(CStr(v))
+    If Len(s) = 0 Then ToSapAmount = "": Exit Function
+    s = Replace$(s, Application.ThousandsSeparator, "")
+    s = Replace$(s, Application.DecimalSeparator, ".")
+    ToSapAmount = s
+End Function
+
+Private Function ToSapQty(ByVal v As Variant) As String
+    If IsNumeric(v) Then
+        ToSapQty = Replace$(Format$(CDbl(v), "0.000"), Application.DecimalSeparator, ".")
+    Else
+        Dim s As String: s = Trim$(CStr(v))
+        s = Replace$(s, Application.ThousandsSeparator, "")
+        s = Replace$(s, Application.DecimalSeparator, ".")
+        ToSapQty = s
+    End If
+End Function
+
+
+' Real page size from the grid, with a sane fallback
+Private Function GetMainPageRows(ByVal ses As Object, ByVal tblId As String, ByVal fallback As Long) As Long
+    On Error Resume Next
+    Dim tbl As Object: Set tbl = ses.findById(tblId)
+    If Err.Number <> 0 Or tbl Is Nothing Then GetMainPageRows = fallback: Err.Clear: Exit Function
+    Dim ps As Long: ps = CLng(tbl.VerticalScrollbar.pageSize)
+    If ps < 3 Or ps > 100 Then ps = fallback
+    GetMainPageRows = ps
+    Err.Clear
+End Function
+
+' Wait until top EBELP actually changes (confirms a real slate change)
+Private Function WaitTopRowChanged_EBELP(ByVal ses As Object, ByVal tblId As String, _
+                                         ByVal colIdx As Long, ByVal prevTop As String, _
+                                         ByVal timeoutMs As Long) As Boolean
+    Dim start As Double: start = Timer
+    Do
+        DoEvents: SleepMs 15
+        Dim curr As String
+        curr = ReadTxtOrCtxt(ses, tblId, F_EBELP, colIdx, 0)
+        If StrComp(curr, prevTop, vbTextCompare) <> 0 Then WaitTopRowChanged_EBELP = True: Exit Function
+    Loop While (Timer - start) * 1000 < timeoutMs
+    WaitTopRowChanged_EBELP = False
+End Function
+
+' Looser equality for numbers (ignore thousands, fixed decimals, etc.)
+Private Function VerifyLooseEqual(ByVal want As String, ByVal got As String) As Boolean
+    Dim a As String, b As String, i As Long, ch As String
+    want = Trim$(want): got = Trim$(got)
+    For i = 1 To Len(want): ch = Mid$(want, i, 1): If (ch >= "0" And ch <= "9") Or ch = "." Then a = a & ch
+    Next i
+    For i = 1 To Len(got): ch = Mid$(got, i, 1): If (ch >= "0" And ch <= "9") Or ch = "." Then b = b & ch
+    Next i
+    VerifyLooseEqual = (a <> "") And (a = b)
+End Function
+
+' Read from either txt* or ctxt* cell (you already use this pattern)
+Private Function ReadTxtOrCtxt(ByVal ses As Object, ByVal tblId As String, ByVal fieldBase As String, _
+                               ByVal colIdx As Long, ByVal localRow As Long) As String
+    On Error Resume Next
+    Dim id As String, t As String
+    id = tblId & "/txt" & fieldBase & "[" & colIdx & "," & localRow & "]"
+    t = CStr(ses.findById(id).Text)
+    If Err.Number = 0 And LenB(t) > 0 Then ReadTxtOrCtxt = Trim$(t): Err.Clear: Exit Function
+    Err.Clear
+    id = tblId & "/ctxt" & fieldBase & "[" & colIdx & "," & localRow & "]"
+    t = CStr(ses.findById(id).Text)
+    If Err.Number = 0 Then ReadTxtOrCtxt = Trim$(t) Else ReadTxtOrCtxt = ""
+    Err.Clear
+End Function
+
