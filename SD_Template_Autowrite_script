@@ -1,0 +1,284 @@
+function main(workbook: ExcelScript.Workbook) {
+    // === SETTINGS ===
+    const dataSheet = workbook.getActiveWorksheet(); // original sheet
+    const dummySheetName = "dummy";
+    const headerRowIndex = 0; // row 1 in Excel (0-based)
+    const fontName = "맑은 고딕";
+    const fontSize = 10;
+    const bodyFillColor = "#FFF5F5"; // super light pink
+
+    // --- Get used range on main sheet ---
+    const usedRange = dataSheet.getUsedRange();
+    if (!usedRange) return;
+
+    const rowCount = usedRange.getRowCount();
+    const colCount = usedRange.getColumnCount();
+
+    // For values
+    type RangeVal = string | number | boolean | Date;
+    type CellVal = RangeVal | null;
+
+    // =========================================
+    // 0. TRIM ALL VALUES, REMOVE LEADING APOSTROPHE
+    // =========================================
+    let values = usedRange.getValues() as CellVal[][]; // 2D array
+
+    for (let r = 0; r < rowCount; r++) {
+        for (let c = 0; c < colCount; c++) {
+            const v = values[r][c];
+            if (v === null) continue;
+
+            if (typeof v === "string") {
+                let s = v.trim();
+                if (s.startsWith("'")) {
+                    s = s.substring(1); // remove leading '
+                }
+                values[r][c] = s;
+            }
+        }
+    }
+
+    usedRange.setValues(values);
+
+    // =========================================
+    // 1. FORMAT HEADER & BODY (FONT + ALIGNMENT + FILL)
+    // =========================================
+
+    // left-align everything
+    usedRange.getFormat().setHorizontalAlignment(ExcelScript.HorizontalAlignment.left);
+
+    // Header row formatting
+    const headerRange = dataSheet.getRangeByIndexes(headerRowIndex, 0, 1, colCount);
+    const headerFormat = headerRange.getFormat();
+    const headerFont = headerFormat.getFont();
+    headerFont.setName(fontName);
+    headerFont.setSize(fontSize);
+    headerFont.setBold(true);
+
+    // Body rows formatting (from row 2 downwards)
+    if (rowCount > 1) {
+        const bodyRange = dataSheet.getRangeByIndexes(headerRowIndex + 1, 0, rowCount - 1, colCount);
+        const bodyFormat = bodyRange.getFormat();
+        const bodyFont = bodyFormat.getFont();
+        bodyFont.setName(fontName);
+        bodyFont.setSize(fontSize);
+        bodyFont.setBold(false);
+        // very light pink fill
+        bodyFormat.getFill().setColor(bodyFillColor);
+    }
+
+    // =========================================
+    // 1-A. COLUMN G → UPPERCASE (DATA ROWS ONLY)
+    // =========================================
+
+    const colGIndex = 6; // G
+
+    for (let r = headerRowIndex + 1; r < rowCount; r++) {
+        const cellG = dataSheet.getCell(r, colGIndex);
+        const valG = cellG.getValue() as RangeVal;
+
+        if (valG === null || valG === "") continue;
+
+        if (typeof valG === "string") {
+            cellG.setValue(valG.toUpperCase());
+        }
+    }
+
+    // =========================================
+    // Helper: convert to number
+    // =========================================
+    function toNumber(v: RangeVal | null): number {
+        if (v === null || v === "") return 0;
+        if (typeof v === "number") return v;
+        const n = Number(v);
+        return isNaN(n) ? 0 : n;
+    }
+
+    // =========================================
+    // 1-B. COLUMN J = H + I (AUTO SUM)
+    // =========================================
+
+    const colHIndex = 7; // H
+    const colIIndex = 8; // I
+    const colJIndex = 9; // J
+
+    for (let r = headerRowIndex + 1; r < rowCount; r++) {
+        const cellH = dataSheet.getCell(r, colHIndex);
+        const cellI = dataSheet.getCell(r, colIIndex);
+        const cellJ = dataSheet.getCell(r, colJIndex);
+
+        const valH = cellH.getValue() as RangeVal;
+        const valI = cellI.getValue() as RangeVal;
+
+        const hasH = !(valH === null || valH === "");
+        const hasI = !(valI === null || valI === "");
+
+        if (hasH || hasI) {
+            const sum = toNumber(valH) + toNumber(valI);
+            cellJ.setValue(sum);
+        } else {
+            cellJ.clear(ExcelScript.ClearApplyTo.contents);
+        }
+    }
+
+    // =========================================
+    // 2. COPY A,B,D,E,F,G OF FIRST DATA ROW DOWN
+    //    UNTIL LAST ROW WHERE COLUMN J IS FILLED
+    // =========================================
+
+    let lastRowWithJ = headerRowIndex; // default
+
+    const colJRange = dataSheet.getRangeByIndexes(0, colJIndex, rowCount, 1);
+    const colJValues = colJRange.getValues() as CellVal[][];
+
+    for (let r = rowCount - 1; r > headerRowIndex; r--) {
+        const v = colJValues[r][0];
+        if (v !== null && v !== "") {
+            lastRowWithJ = r;
+            break;
+        }
+    }
+
+    // Only copy if we have at least one data row with J value
+    if (lastRowWithJ > headerRowIndex) {
+        const dataStartRow = headerRowIndex + 1; // row 2
+        const height = lastRowWithJ - dataStartRow + 1;
+
+        const colsToCopy: number[] = [0, 1, 3, 4, 5, 6]; // A,B,D,E,F,G (0-based)
+
+        colsToCopy.forEach(colIdx => {
+            const source = dataSheet.getRangeByIndexes(dataStartRow, colIdx, 1, 1);
+            const target = dataSheet.getRangeByIndexes(dataStartRow, colIdx, height, 1);
+            target.copyFrom(source, ExcelScript.RangeCopyType.all);
+        });
+    }
+
+    // =========================================
+    // 3. COLUMN L → MUST BE 10 DIGITS STARTING WITH 4
+    //    ELSE MOVE VALUE TO COLUMN N
+    // =========================================
+
+    const colLIndex = 11; // L
+    const colNIndex = 13; // N
+    const colOIndex = 14; // O
+    const tenDigitStartsWith4 = /^4\d{9}$/;
+
+    for (let r = headerRowIndex + 1; r < rowCount; r++) {
+        const cellL = dataSheet.getCell(r, colLIndex);
+        const valL = cellL.getValue() as RangeVal;
+
+        if (valL === null || valL === "") continue;
+
+        const s = valL.toString().trim();
+
+        if (tenDigitStartsWith4.test(s)) {
+            // Valid 10-digit starting with 4 → keep in L
+            cellL.setValue(s);
+        } else {
+            // Move to column N, clear L
+            const cellN = dataSheet.getCell(r, colNIndex);
+            cellN.setValue(s);
+            cellL.clear(ExcelScript.ClearApplyTo.contents);
+        }
+    }
+
+    // =========================================
+    // 4. COLUMN K LOGIC: "PO" / "MAT"
+    //    - If L has value → "PO"
+    //    - If O has value → "MAT" (overwrites PO if both)
+    // =========================================
+
+    const colKIndex = 10; // K
+
+    for (let r = headerRowIndex + 1; r < rowCount; r++) {
+        const cellK = dataSheet.getCell(r, colKIndex);
+
+        const valL = dataSheet.getCell(r, colLIndex).getValue() as RangeVal;
+        const valO = dataSheet.getCell(r, colOIndex).getValue() as RangeVal;
+
+        let result = "";
+
+        if (!(valL === null || valL === "")) {
+            result = "PO";
+        }
+        if (!(valO === null || valO === "")) {
+            result = "MAT"; // overwrite if both exist
+        }
+
+        if (result !== "") {
+            cellK.setValue(result);
+        } else {
+            cellK.clear(ExcelScript.ClearApplyTo.contents);
+        }
+    }
+
+    // =========================================
+    // 5. IF COLUMN N HAS VALUE → VLOOKUP USING THAT VALUE
+    //    LOOKUP KEY = ORIGINAL SHEET COLUMN N
+    //    IN dummy!COLUMN C, RETURN dummy!COLUMN B → PUT INTO ORIGINAL COLUMN O
+    // =========================================
+
+    const dummySheet = workbook.getWorksheet(dummySheetName);
+    if (dummySheet) {
+        const dummyUsed = dummySheet.getUsedRange();
+        if (dummyUsed) {
+            const dummyVals = dummyUsed.getValues() as CellVal[][];
+            const dummyRowCount = dummyUsed.getRowCount();
+            const dummyColCount = dummyUsed.getColumnCount();
+
+            const dummyColBIndex = 1; // B
+            const dummyColCIndex = 2; // C
+
+            for (let r = headerRowIndex + 1; r < rowCount; r++) {
+                const cellN = dataSheet.getCell(r, colNIndex);
+                const valN = cellN.getValue() as RangeVal;
+
+                if (valN === null || valN === "") continue;
+
+                const lookupKey = valN.toString().trim();
+                if (lookupKey === "") continue;
+
+                let foundValue: CellVal = null;
+
+                // Manual search in dummy!C
+                for (let dr = 1; dr < dummyRowCount; dr++) { // skip dummy header
+                    if (dummyColCIndex >= dummyColCount || dummyColBIndex >= dummyColCount) break;
+
+                    const keyCell = dummyVals[dr][dummyColCIndex];
+                    if (keyCell === null) continue;
+
+                    const keyText = keyCell.toString().trim();
+                    if (keyText === lookupKey) {
+                        foundValue = dummyVals[dr][dummyColBIndex];
+                        break;
+                    }
+                }
+
+                if (foundValue !== null && foundValue !== "") {
+                    const cellO = dataSheet.getCell(r, colOIndex);
+                    cellO.setValue(foundValue);
+                }
+            }
+        }
+    }
+
+    // =========================================
+    // 6. FORMAT H, I, J WITH COMMA SEPARATORS ONLY (#,##0)
+    // =========================================
+    if (rowCount > 1) {
+        const dataRows = rowCount - 1;
+        const numRange = dataSheet.getRangeByIndexes(
+            headerRowIndex + 1, // start after header
+            colHIndex,          // from H
+            dataRows,
+            3                   // H, I, J
+        );
+
+        // Apply uniform format to the whole range
+        const fmt: string[][] = [];
+        for (let r = 0; r < dataRows; r++) {
+            fmt[r] = ["#,##0", "#,##0", "#,##0"];
+        }
+        numRange.setNumberFormatLocal(fmt);
+    }
+}
