@@ -1,0 +1,102 @@
+let
+    // 1) 엑셀 표 읽기 - "Table1"을 실제 표 이름으로 바꿔주세요
+    Source = Excel.CurrentWorkbook(){[Name="Table1"]}[Content],
+
+    // 2) 텍스트로 변환 + 공백 제거
+    #"Changed Type" = Table.TransformColumnTypes(Source,{{"열1", type text}}),
+    #"Trimmed" = Table.TransformColumns(#"Changed Type", {{"열1", Text.Trim, type text}}),
+
+    // 3) 인덱스 추가
+    #"Added Index" = Table.AddIndexColumn(#"Trimmed", "Index", 0, 1, Int64.Type),
+
+    // 4) 현재 행 아래 4줄을 각각 Qty / Unit / UnitPrice / TotalPrice 후보로 가져오기
+    #"Added Next1" = Table.AddColumn(
+        #"Added Index",
+        "QtyText",
+        each try #"Added Index"{[Index]+1}[#"열1"] otherwise null,
+        type text
+    ),
+    #"Added Next2" = Table.AddColumn(
+        #"Added Next1",
+        "UnitText",
+        each try #"Added Next1"{[Index]+2}[#"열1"] otherwise null,
+        type text
+    ),
+    #"Added Next3" = Table.AddColumn(
+        #"Added Next2",
+        "UnitPriceText",
+        each try #"Added Next2"{[Index]+3}[#"열1"] otherwise null,
+        type text
+    ),
+    #"Added Next4" = Table.AddColumn(
+        #"Added Next3",
+        "TotalPriceText",
+        each try #"Added Next3"{[Index]+4}[#"열1"] otherwise null,
+        type text
+    ),
+
+    // 5) 이 행이 "품목 시작줄"인지 판별
+    #"Added IsStart" = Table.AddColumn(
+        #"Added Next4",
+        "IsStart",
+        each
+            let
+                code        = [열1],
+                qty         = [QtyText],
+                unit        = [UnitText],
+                unitPrice   = [UnitPriceText],
+                totalPrice  = [TotalPriceText],
+
+                isCode =
+                    Text.Length(code) = 15 and
+                    Text.Middle(code, 6, 1) = "-" and
+                    Text.Middle(code, 11, 1) = "-",
+
+                isQty =
+                    (try Number.FromText(qty) otherwise null) <> null,
+
+                isUnit =
+                    Text.Upper(Text.Trim(unit)) = "PC",
+
+                isUnitPrice =
+                    (try Number.FromText(unitPrice) otherwise null) <> null,
+
+                isTotalPrice =
+                    (try Number.FromText(totalPrice) otherwise null) <> null
+            in
+                isCode and isQty and isUnit and isUnitPrice and isTotalPrice,
+        type logical
+    ),
+
+    // 6) 품목 시작줄만 필터
+    #"Filtered Rows" = Table.SelectRows(#"Added IsStart", each [IsStart] = true),
+
+    // 7) 필요한 컬럼만 선택 + 이름 변경
+    #"Selected Columns" = Table.SelectColumns(
+        #"Filtered Rows",
+        {"열1", "QtyText", "UnitText", "UnitPriceText", "TotalPriceText"}
+    ),
+    #"Renamed Columns" = Table.RenameColumns(
+        #"Selected Columns",
+        {
+            {"열1", "ItemCode"},
+            {"QtyText", "Qty"},
+            {"UnitText", "Unit"},
+            {"UnitPriceText", "UnitPrice"},
+            {"TotalPriceText", "TotalPrice"}
+        }
+    ),
+
+    // 8) 타입 지정
+    #"Changed Type Final" = Table.TransformColumnTypes(
+        #"Renamed Columns",
+        {
+            {"ItemCode", type text},
+            {"Qty", Int64.Type},
+            {"Unit", type text},
+            {"UnitPrice", type number},
+            {"TotalPrice", type number}
+        }
+    )
+in
+    #"Changed Type Final"
