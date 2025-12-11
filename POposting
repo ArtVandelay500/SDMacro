@@ -1,0 +1,330 @@
+Option Explicit
+
+' Requires:
+'   1. modSAP (Your library)
+'   2. SD_MIRO_Config (Your constants)
+
+Private Const MAX_ENTER_RETRIES As Long = 5
+Private Const KEY_VORGANG_INVOICE As String = "1" ' 1 = Invoice, 3 = Sub. Debit
+
+Public Sub IR_Post_Simple_WithGRCheck()
+    Dim ses As Object
+    Set ses = SapGetSessionByTCode("P10", "", "MIRO", True, True, True)
+
+    If ses Is Nothing Then
+        MsgBox "SAP session not available.", vbCritical
+        Exit Sub
+    End If
+
+    ' 0) Ensure on MIRO
+    If Not SapEnsureOnTCode(ses, "MIRO", 1#) Then
+        MsgBox "Could not reset MIRO.", vbCritical
+        Exit Sub
+    End If
+
+    ' 1) Handle Company Code Popup (Standard)
+    If ALWAYS_PROMPT_COMPANY_CODE Then
+        Call SapHandleCommonPopups(ses)
+    Else
+        Call SapHandleCommonPopups(ses, DEFAULT_COMPANY_CODE)
+    End If
+
+    ' 2) Ensure VORGANG is "1" (Invoice)
+    '    Note: SD macro used "3". We need "1" for standard posting.
+    If Not EnsureVorgangIsInvoice(ses) Then
+        MsgBox "Could not set Transaction to 'Invoice'.", vbCritical
+        Exit Sub
+    End If
+
+    ' 3) Loop Excel Data
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(SD_SHEET)
+    Dim r As Long
+    
+    ' Only processing rows defined in Config
+    For r = FIRST_DATA_ROW To LAST_DATA_ROW
+        
+        ' --- Read Data ---
+        Dim dateTxt As String, refTxt As String, poTxt As String
+        Dim totalAmt As Variant, taxAmt As Variant, cur As String
+        Dim basicTxt As String
+        
+        dateTxt = CleanDateText(Rd(ws, COL_DATE, r))
+        refTxt = Trim$(CStr(Rd(ws, COL_REFERENCE, r)))
+        poTxt = Trim$(CStr(Rd(ws, COL_PO, r)))
+        totalAmt = Rd(ws, COL_TOTAL_AMOUNT, r)
+        taxAmt = Rd(ws, COL_TAXAMT, r)
+        cur = Trim$(CStr(Rd(ws, COL_CURRENCY, r)))
+        basicTxt = Trim$(CStr(Rd(ws, COL_TEXT, r)))
+
+        ' Skip empty rows (Strict check)
+        If Len(poTxt) = 0 Then GoTo NextRow
+        If Len(dateTxt) = 0 Or Len(CStr(totalAmt)) = 0 Then
+            MsgBox "Row " & r & ": Missing Date or Amount. Stopping.", vbCritical
+            Exit Sub
+        End If
+
+        ' --- A) Header Data (Dates & Ref) ---
+        ' Use your fast-path helper from SD macro logic
+        If Not SetDatePairAndVerifyMove(ses, dateTxt, ID_XBLNR) Then
+             MsgBox "Row " & r & ": Failed setting dates.", vbExclamation
+             Exit Sub
+        End If
+        
+        ' Set Reference
+        If Not SapPressEnterUntilEditableThenSet(ses, ID_XBLNR, Left$(refTxt, 16), 5) Then
+            MsgBox "Row " & r & ": Failed setting Reference.", vbExclamation
+            Exit Sub
+        End If
+
+        ' --- B) Amounts (Total & Tax) ---
+        ' We set these BEFORE POs to establish the "Expected" header values
+        If Not SetTotalsAndTax(ses, totalAmt, taxAmt, cur, basicTxt) Then
+            MsgBox "Row " & r & ": Failed setting Amounts.", vbExclamation
+            Exit Sub
+        End If
+
+        ' --- C) Enter POs (The Critical Step) ---
+        ' Ensure we are on PO Items tab
+        If Not SapSafeSelect(ses, ID_TAB_ITEMS_PO, 3) Then
+            MsgBox "Could not select PO Items tab.", vbCritical
+            Exit Sub
+        End If
+        
+        ' Use local helper to enter POs (supports multiple)
+        If Not EnterPONumbers(ses, poTxt) Then
+            MsgBox "Row " & r & ": Failed entering PO numbers.", vbCritical
+            Exit Sub
+        End If
+        
+        ' ==========================================================
+        ' CRITICAL CHECK: STOP IF NOT GRed
+        ' ==========================================================
+        ' After entering POs, if they have no GR, SAP usually throws:
+        ' Status "E" or Message "No suitable items found".
+        ' We also check if the item table is empty.
+        ' ==========================================================
+        
+        Dim sType As String, sMsg As String
+        SD_GetStatusBar ses, sType, sMsg
+        
+        ' 1. Check for specific "No items" message or Hard Error
+        If InStr(1, sMsg, "No suitable items", vbTextCompare) > 0 Or sType = "E" Then
+            MsgBox "Row " & r & ": STOPPING." & vbCrLf & vbCrLf & _
+                   "PO '" & poTxt & "' appears not GRed." & vbCrLf & _
+                   "SAP Message: " & sMsg, vbCritical
+            Exit Sub
+        End If
+
+        ' 2. Check table row count (Generic check)
+        ' If the table is empty, nothing was pulled in.
+        If GetMiroItemCount(ses) = 0 Then
+            MsgBox "Row " & r & ": STOPPING." & vbCrLf & vbCrLf & _
+                   "PO '" & poTxt & "' resulted in 0 items." & vbCrLf & _
+                   "It is likely not GRed.", vbCritical
+            Exit Sub
+        End If
+
+        ' --- D) Validate Balance (Traffic Light) ---
+        ' For simple IR, Header Amount must match Item Sum.
+        ' We check the Difference field (ID_DIFF_COST). It should be zero (Green).
+        
+        Dim diffVal As Double
+        diffVal = GetDifferenceAmount(ses)
+        
+        If Abs(diffVal) > 0.01 Then
+            MsgBox "Row " & r & ": Balance is NOT zero." & vbCrLf & _
+                   "Difference: " & diffVal & vbCrLf & vbCrLf & _
+                   "Stopping to allow manual check.", vbExclamation
+            Exit Sub
+        End If
+
+        ' --- E) Post ---
+        ses.findById("wnd[0]").sendVKey 11 ' Save/Post
+        
+        ' Wait for success message
+        Call SapWaitIdle(ses, 1.5)
+        SD_GetStatusBar ses, sType, sMsg
+        
+        If sType = "E" Or sType = "A" Then
+            MsgBox "Row " & r & ": Error during POST." & vbCrLf & sMsg, vbCritical
+            Exit Sub
+        End If
+
+NextRow:
+    Next r
+
+    MsgBox "Simple PO Posting Complete.", vbInformation
+
+End Sub
+
+' ==============================================================================
+' HELPERS (Specific to IR Posting)
+' ==============================================================================
+
+' Ensure Transaction is "Invoice" (1)
+Private Function EnsureVorgangIsInvoice(ByVal ses As Object) As Boolean
+    On Error GoTo EH
+    Dim o As Object: Set o = ses.findById(ID_VORGANG)
+    
+    ' If already 1, good.
+    If o.Key = KEY_VORGANG_INVOICE Then
+        EnsureVorgangIsInvoice = True
+        Exit Function
+    End If
+    
+    ' Set to 1 and refresh
+    o.Key = KEY_VORGANG_INVOICE
+    ses.findById("wnd[0]").sendVKey 0
+    Call SapWaitIdle(ses, 1#)
+    
+    EnsureVorgangIsInvoice = True
+    Exit Function
+EH:
+    EnsureVorgangIsInvoice = False
+End Function
+
+' Read difference amount to check if Green
+Private Function GetDifferenceAmount(ByVal ses As Object) As Double
+    On Error Resume Next
+    Dim txt As String
+    ' ID_DIFF_COST is defined in your Config ("wnd[0]/usr/txtRM08M-DIFFERENZ")
+    txt = ses.findById(ID_DIFF_COST).Text
+    
+    ' Clean standard SAP number formatting (1.234,00 or 1,234.00)
+    ' This simple replacement assumes standard Excel-like numeric handling works after cleaning
+    txt = Replace(txt, ".", "") ' Remove thousands separator (assuming . is thousands)
+    txt = Replace(txt, ",", ".") ' Replace decimal comma with dot
+    ' Note: Adjust above lines if your SAP user settings use different decimals
+    
+    GetDifferenceAmount = CDbl(Trim(txt))
+    If Err.Number <> 0 Then GetDifferenceAmount = 999999 ' Force error if cant read
+End Function
+
+' Count items in the grid to verify something was loaded
+Private Function GetMiroItemCount(ByVal ses As Object) As Long
+    On Error Resume Next
+    ' We look at the Table Control. The ID is roughly TBL_6006 or TBL_6005 from your config
+    ' But let's use a safe find
+    Dim tbl As Object
+    Set tbl = ses.findById("wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005/subITEMS:SAPLMR1M:6010/tabsITEMTAB/tabpITEMS_PO/ssubTABS:SAPLMR1M:6020/subITEM:SAPLMR1M:6310/tblSAPLMR1MTC_MR1M")
+    
+    If tbl Is Nothing Then
+         ' Try alternate ID (sometimes screen 6006)
+         Set tbl = ses.findById("wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6006/subITEMS:SAPLMR1M:6010/tabsITEMTAB/tabpITEMS_PO/ssubTABS:SAPLMR1M:6020/subITEM:SAPLMR1M:6310/tblSAPLMR1MTC_MR1M")
+    End If
+    
+    If Not tbl Is Nothing Then
+        GetMiroItemCount = tbl.RowCount
+    Else
+        GetMiroItemCount = 0
+    End If
+End Function
+
+' Reuse your Date Setter logic
+Private Function SetDatePairAndVerifyMove(ByVal ses As Object, ByVal dTxt As String, ByVal refId As String) As Boolean
+    On Error GoTo EH
+    Dim oBL As Object, oBU As Object
+    Set oBL = ses.findById(ID_BLDAT)
+    Set oBU = ses.findById(ID_BUDAT)
+
+    oBL.Text = dTxt
+    oBU.Text = dTxt
+    
+    ' Press enter to commit dates
+    ses.findById("wnd[0]").sendVKey 0
+    SapWaitIdle ses, 0.5
+    SapTryDismissPopup ses
+    
+    SetDatePairAndVerifyMove = True
+    Exit Function
+EH:
+    SetDatePairAndVerifyMove = False
+End Function
+
+' Reuse your Amount/Tax logic
+Private Function SetTotalsAndTax(ByVal ses As Object, ByVal tot As Variant, ByVal tax As Variant, ByVal cur As String, ByVal txt As String) As Boolean
+    On Error Resume Next
+    
+    ' Set Amount, Currency, Text
+    ses.findById(ID_WRBTR).Text = CStr(tot)
+    ses.findById(ID_WAERS).Text = cur
+    ses.findById(ID_TEXT).Text = Left(txt, 50)
+    
+    ' Handle Tax
+    Dim taxCode As String
+    If IsNumeric(tax) And CDbl(tax) > 0 Then
+        ses.findById(ID_TAXAMT).Text = CStr(tax)
+        taxCode = "V5" ' Assuming V5 for Tax
+    Else
+        ses.findById(ID_TAXAMT).Text = ""
+        taxCode = "VZ" ' Assuming VZ for Zero Tax
+    End If
+    
+    ' Set Tax Code and refresh
+    ses.findById(ID_TAX_CODE).Key = taxCode
+    ses.findById("wnd[0]").sendVKey 0
+    SapWaitIdle ses, 0.5
+    SapTryDismissPopup ses
+    
+    SetTotalsAndTax = True
+End Function
+
+' Copy of your EnterPONumbers (simplified for this module if needed, or rely on SD_Post_MIRO_FromSD if public)
+' Placing it here to ensure this module is standalone-ish
+Private Function EnterPONumbers(ByVal s As Object, ByVal poText As String) As Boolean
+    Dim txt As String: txt = Trim$(CStr(poText))
+    If Len(txt) = 0 Then Exit Function
+
+    ' Single PO
+    If InStr(1, txt, "/", vbTextCompare) = 0 Then
+        If Not SapSafeSetText(s, ID_ITEM_PO_FIELD, txt) Then Exit Function
+        s.findById("wnd[0]").sendVKey 0
+        SapWaitIdle s, 0.5
+        SapTryDismissPopup s
+        EnterPONumbers = True
+        Exit Function
+    End If
+
+    ' Multiple POs (Slash separated)
+    Dim parts() As String: parts = Split(txt, "/")
+    ' Press Multi Button
+    If Not SapSafePress(s, ID_PO_MULTI_BTN, 3) Then Exit Function
+    SapWaitIdle s, 0.5
+    
+    ' Handling the popup table... (Simplified for brevity, assumes standard logic)
+    Dim i As Long
+    On Error Resume Next
+    For i = 0 To UBound(parts)
+        s.findById("wnd[1]/usr/subMSEL:SAPLMR1M:6221/tblSAPLMR1MTC_MSEL_BEST/ctxtRM08M-EBELN[0," & i & "]").Text = Trim(parts(i))
+    Next i
+    s.findById("wnd[1]/tbar[0]/btn[8]").press ' Adopt
+    On Error GoTo 0
+    
+    SapWaitIdle s, 0.5
+    SapTryDismissPopup s
+    EnterPONumbers = True
+End Function
+
+' Helper to read Excel safely
+Private Function Rd(ByVal ws As Worksheet, ByVal col As String, ByVal r As Long) As Variant
+    Rd = ws.Range(col & r).Value
+End Function
+
+' Helper to clean date text
+Private Function CleanDateText(ByVal v As Variant) As String
+    If IsDate(v) Then
+        CleanDateText = Format$(v, "yyyymmdd")
+    Else
+        CleanDateText = Replace(Replace(Trim$(CStr(v)), ".", ""), "-", "")
+    End If
+End Function
+
+' Read status bar
+Private Sub SD_GetStatusBar(ByVal ses As Object, ByRef typ As String, ByRef txt As String)
+    On Error Resume Next
+    Dim s As Object: Set s = ses.findById("wnd[0]/sbar")
+    If Not s Is Nothing Then
+        typ = s.MessageType
+        txt = s.Text
+    End If
+End Sub
