@@ -1,0 +1,73 @@
+Option Explicit
+
+' ==============================================================================
+' ModSAP_Scrolling (FIXED)
+' ==============================================================================
+
+Public Function SapGrid_ScrollToRow(ByVal ses As Object, _
+                                    ByVal tblObj As Object, _
+                                    ByVal targetRow As Long, _
+                                    Optional ByVal SendEnter As Boolean = False) As Boolean
+    On Error Resume Next
+    
+    ' 1. Optimization: Don't scroll if already there
+    ' (Check this BEFORE pressing Enter)
+    If CLng(tblObj.VerticalScrollbar.Position) = targetRow Then
+        SapGrid_ScrollToRow = True
+        Exit Function
+    End If
+
+    ' 2. Scroll
+    tblObj.VerticalScrollbar.Position = targetRow
+    
+    ' 3. Handle Enter (Critical for MR22)
+    If SendEnter Then
+        ses.findById("wnd[0]").sendVKey 0 ' Enter
+        
+        ' CRITICAL FIX:
+        ' Once Enter is pressed, tblObj is DEAD. Attempting to verify it will crash.
+        ' We return True and let the Main Sub handle the re-binding.
+        SapGrid_ScrollToRow = True
+        Exit Function
+    End If
+    
+    ' 4. Verification (Only if we didn't press Enter)
+    If CLng(tblObj.VerticalScrollbar.Position) <> targetRow Then
+        tblObj.SetFocus
+        tblObj.VerticalScrollbar.Position = targetRow
+    End If
+    
+    SapGrid_ScrollToRow = (CLng(tblObj.VerticalScrollbar.Position) = targetRow)
+    On Error GoTo 0
+End Function
+
+' (Keep SapGrid_GetPageSize and SapGrid_FindTable as they were)
+Public Function SapGrid_GetPageSize(ByVal tblObj As Object, Optional ByVal DefaultVal As Long = 12, Optional ByVal MaxLimit As Long = 25) As Long
+    On Error Resume Next
+    Dim ps As Long
+    ps = CLng(tblObj.VerticalScrollbar.pageSize)
+    If ps < 1 Or ps > 200 Then
+        SapGrid_GetPageSize = DefaultVal
+    ElseIf ps > MaxLimit Then
+        SapGrid_GetPageSize = MaxLimit
+    Else
+        SapGrid_GetPageSize = ps
+    End If
+    On Error GoTo 0
+End Function
+
+Public Function SapGrid_FindTable(ByVal ses As Object, ParamArray possibleIds() As Variant) As Object
+    Dim i As Long, tObj As Object
+    For i = LBound(possibleIds) To UBound(possibleIds)
+        On Error Resume Next
+        Set tObj = ses.findById(possibleIds(i))
+        On Error GoTo 0
+        If Not tObj Is Nothing Then
+            Set SapGrid_FindTable = tObj
+            Exit Function
+        End If
+    Next i
+    Set SapGrid_FindTable = Nothing
+End Function
+
+
