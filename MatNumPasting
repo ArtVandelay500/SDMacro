@@ -1,0 +1,188 @@
+Option Explicit
+' Requires: modSAP
+
+' ==============================================================================
+' 1. USER CONFIGURATION
+' ==============================================================================
+Private Const XL_SHEET_NAME     As String = "MaterialData"
+Private Const XL_START_ROW      As Long = 2
+
+Private Const COL_MATERIAL      As String = "N"
+Private Const COL_PLANT         As String = "O"
+Private Const COL_AMOUNT        As String = "P"
+Private Const COL_QTY           As String = "Q"
+
+' Scroll Settings:
+' 25 matches your recording. Change to 0 if you want auto-detection.
+Private Const SAP_FORCE_PAGE_SIZE As Long = 25
+
+' ==============================================================================
+' 2. MAIN SCRIPT
+' ==============================================================================
+Public Sub Paste_Material_MR22_Final()
+    Dim ses As Object
+    Set ses = SapGetSessionByTCode("P10", "", "MIRO", True, False, True)
+
+    If ses Is Nothing Then
+        MsgBox "SAP session not available.", vbCritical
+        Exit Sub
+    End If
+
+    ' --- Find Table ID ---
+    Dim tblId As String
+    tblId = FindMaterialTableID(ses)
+    If tblId = "" Then
+        MsgBox "Could not find the Material table (MR22).", vbExclamation
+        Exit Sub
+    End If
+
+    ' --- Determine Page Size ---
+    Dim pageRows As Long
+    If SAP_FORCE_PAGE_SIZE > 0 Then
+        pageRows = SAP_FORCE_PAGE_SIZE
+    Else
+        On Error Resume Next
+        pageRows = ses.findById(tblId).VerticalScrollbar.PageSize
+        On Error GoTo 0
+        If pageRows < 1 Then pageRows = 12
+    End If
+
+    ' --- Prepare Excel ---
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(XL_SHEET_NAME)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        MsgBox "Sheet '" & XL_SHEET_NAME & "' not found.", vbCritical
+        Exit Sub
+    End If
+
+    ' --- Loop and Paste ---
+    Dim r As Long, k As Long, localRow As Long
+    Dim mat As String, plant As String, amt As Variant, qty As Variant
+    
+    k = 0
+    
+    For r = XL_START_ROW To 10000
+        
+        ' 1. Read Data
+        mat = Trim$(CStr(ws.Range(COL_MATERIAL & r).value))
+        If Len(mat) = 0 Then Exit For
+        
+        plant = Trim$(CStr(ws.Range(COL_PLANT & r).value))
+        amt = ws.Range(COL_AMOUNT & r).value
+        qty = ws.Range(COL_QTY & r).value
+        
+        ' 2. Compute local row
+        localRow = k Mod pageRows
+        
+        ' 3. SCROLLING LOGIC
+        If (k > 0) And (localRow = 0) Then
+            
+            ' A) Set Scroll Position
+            On Error Resume Next
+            ses.findById(tblId).VerticalScrollbar.Position = k
+            On Error GoTo 0
+            
+            ' B) HIT ENTER (New Request)
+            '    SAP often throws a warning when scrolling (validating previous rows).
+            '    Pressing Enter acknowledges/clears the warning so the scroll can complete.
+            ses.findById("wnd[0]").sendVKey 0
+            DoEvents
+            
+            ' C) WAIT FOR REFRESH
+            If Not WaitForCleanSlate(ses, tblId) Then
+                 MsgBox "Timed out waiting for SAP to load new rows at item " & k & ".", vbCritical
+                 Exit Sub
+            End If
+            
+        End If
+        
+        ' 4. WRITE DATA
+        On Error Resume Next
+        
+        ' Material
+        ses.findById(tblId & "/ctxtCKI_MR22_0250-MATNR[0," & localRow & "]").Text = mat
+        
+        ' Plant
+        If Len(plant) > 0 Then
+            ses.findById(tblId & "/ctxtCKI_MR22_0250-BWKEY[1," & localRow & "]").Text = plant
+        End If
+        
+        ' Amount (Rounded to Integer)
+        If Not IsEmpty(amt) And Len(CStr(amt)) > 0 Then
+            ses.findById(tblId & "/txtCKI_MR22_0250-ZUUMB[4," & localRow & "]").Text = ToSapNumber(amt)
+        End If
+        
+        ' Quantity (Rounded to Integer)
+        If Not IsEmpty(qty) And Len(CStr(qty)) > 0 Then
+             ses.findById(tblId & "/txtCKI_MR22_0250-MENGE[5," & localRow & "]").Text = ToSapNumber(qty)
+        End If
+        On Error GoTo 0
+        
+        k = k + 1
+    Next r
+
+    MsgBox "Pasting complete (" & k & " items).", vbInformation
+
+End Sub
+
+
+' ==============================================================================
+' 3. HELPERS
+' ==============================================================================
+
+Private Function WaitForCleanSlate(ByVal ses As Object, ByVal tblId As String) As Boolean
+    Dim tStart As Single
+    Dim val As String
+    tStart = Timer
+    
+    Do
+        DoEvents
+        On Error Resume Next
+        ' Check Material field of first row
+        val = ses.findById(tblId & "/ctxtCKI_MR22_0250-MATNR[0,0]").Text
+        On Error GoTo 0
+        
+        ' Empty = Ready
+        If Trim$(val) = "" Then
+            WaitForCleanSlate = True
+            Exit Function
+        End If
+        
+        ' Timeout after 5 seconds
+        If Timer - tStart > 5 Then Exit Do
+    Loop
+    WaitForCleanSlate = False
+End Function
+
+' UPDATED: Forces number to integer string (No Decimals)
+Private Function ToSapNumber(ByVal v As Variant) As String
+    If IsNumeric(v) And Not IsEmpty(v) Then
+        ' Round to 0 decimal places
+        ToSapNumber = Format$(CDbl(v), "0")
+    Else
+        ToSapNumber = CStr(v)
+    End If
+End Function
+
+Private Function FindMaterialTableID(ByVal ses As Object) As String
+    Dim suffix As String
+    suffix = "/subITEMS:SAPLMR1M:6010/tabsITEMTAB/tabpITEMS_MAT/ssubTABS:SAPLMR1M:6030/ssubMATERIAL:SAPRCKM_MR22:0250/tblSAPRCKM_MR22MR22_TABCONTROL"
+    
+    If SapExistsId(ses, "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6006" & suffix) Then
+        FindMaterialTableID = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6006" & suffix
+        Exit Function
+    End If
+    If SapExistsId(ses, "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005" & suffix) Then
+        FindMaterialTableID = "wnd[0]/usr/subHEADER_AND_ITEMS:SAPLMR1M:6005" & suffix
+        Exit Function
+    End If
+    FindMaterialTableID = ""
+End Function
+
+Private Function SapExistsId(ByVal ses As Object, ByVal id As String) As Boolean
+    On Error Resume Next
+    Dim o As Object: Set o = ses.findById(id)
+    SapExistsId = Not o Is Nothing
+End Function
