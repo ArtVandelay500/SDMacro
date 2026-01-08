@@ -42,9 +42,9 @@ Option Explicit
 ' RETURNS:
 '   The SAP session object, or Nothing if unavailable.
 Public Function SapGetSessionByTCode( _
-    ByVal SystemPrefix As String, _
-    ByVal ClientExact As String, _
-    ByVal TCode As String, _
+    ByVal systemPrefix As String, _
+    ByVal clientExact As String, _
+    ByVal tcode As String, _
     Optional ByVal PreferReuse As Boolean = True, _
     Optional ByVal ResetOnReuse As Boolean = True, _
     Optional ByVal ShowStatus As Boolean = False _
@@ -61,13 +61,13 @@ Public Function SapGetSessionByTCode( _
 
     ' 1) Reuse a session already on the TCode (don’t touch other windows)
     If PreferReuse Then
-        Set ses = SapFindSessionByTCode(app, SystemPrefix, ClientExact, TCode)
+        Set ses = SapFindSessionByTCode(app, systemPrefix, clientExact, tcode)
         If Not ses Is Nothing Then
             mode = "Reused"
             ' Always reset to a clean screen if asked (even if already same TCode)
             If ResetOnReuse Then
                 On Error Resume Next
-                ses.findById("wnd[0]/tbar[0]/okcd").Text = "/n" & UCase$(TCode)
+                ses.findById("wnd[0]/tbar[0]/okcd").Text = "/n" & UCase$(tcode)
                 ses.findById("wnd[0]").sendVKey 0
                 On Error GoTo 0
             End If
@@ -76,15 +76,15 @@ Public Function SapGetSessionByTCode( _
     End If
 
     ' 2) Find a matching connection and open /o<TCode> in a NEW window
-    Set con = SapFindConnection(app, SystemPrefix, ClientExact)
+    Set con = SapFindConnection(app, systemPrefix, clientExact)
     If con Is Nothing Then
         ' If no existing connection matches, try to open by SystemPrefix (SAP Logon entry name)
         On Error Resume Next
-        Set con = app.OpenConnection(SystemPrefix, True)
+        Set con = app.OpenConnection(systemPrefix, True)
         On Error GoTo 0
         If con Is Nothing Then
-            If ShowStatus Then MsgBox "No active connection for '" & SystemPrefix & _
-               IIf(Len(ClientExact) > 0, "' client " & ClientExact, "'") & ".", vbExclamation, "SAP"
+            If ShowStatus Then MsgBox "No active connection for '" & systemPrefix & _
+               IIf(Len(clientExact) > 0, "' client " & clientExact, "'") & ".", vbExclamation, "SAP"
             Exit Function
         End If
     End If
@@ -93,12 +93,12 @@ Public Function SapGetSessionByTCode( _
     Dim ref As Object
     Set ref = SapGetChild(con, 0)
     beforeCnt = SapChildCount(con)
-    ref.findById("wnd[0]/tbar[0]/okcd").Text = "/o" & UCase$(TCode)
+    ref.findById("wnd[0]/tbar[0]/okcd").Text = "/o" & UCase$(tcode)
     ref.findById("wnd[0]").sendVKey 0
 
     ' Wait until the new session exists
     If Not SapWaitSessionCount(con, beforeCnt + 1, 8#) Then
-        If ShowStatus Then MsgBox "Timeout creating /o" & TCode & ".", vbCritical, "SAP"
+        If ShowStatus Then MsgBox "Timeout creating /o" & tcode & ".", vbCritical, "SAP"
         Exit Function
     End If
 
@@ -115,7 +115,7 @@ Ready:
 
     If ShowStatus Then
         Application.StatusBar = "SAP ? " & mode & " | Sys=" & SafeStr(ses.Info.SystemName) & _
-            " / Client=" & SafeStr(ses.Info.client) & " / T=" & SafeStr(ses.Info.Transaction)
+            " / Client=" & SafeStr(ses.Info.Client) & " / T=" & SafeStr(ses.Info.Transaction)
     End If
 
     Set SapGetSessionByTCode = ses
@@ -134,10 +134,10 @@ End Function
 '
 ' RETURNS:
 '   True if a tabstrip (an ID containing "tabsTABSTRIP") was detected in time.
-Public Function SapEnsureOnTCode(ByVal sess As Object, ByVal TCode As String, _
+Public Function SapEnsureOnTCode(ByVal sess As Object, ByVal tcode As String, _
                                  Optional ByVal timeoutSec As Double = 8#) As Boolean
     On Error Resume Next
-    sess.findById("wnd[0]/tbar[0]/okcd").Text = "/n" & UCase$(TCode)
+    sess.findById("wnd[0]/tbar[0]/okcd").Text = "/n" & UCase$(tcode)
     sess.findById("wnd[0]").sendVKey 0
     Err.Clear
 
@@ -319,7 +319,7 @@ End Function
 ' Find an already-open session that matches System/Client and is on TCode.
 ' RETURNS:
 '   The session object if found, else Nothing.
-Private Function SapFindSessionByTCode(app As Object, sysPrefix As String, ClientExact As String, TCode As String) As Object
+Private Function SapFindSessionByTCode(app As Object, sysPrefix As String, clientExact As String, tcode As String) As Object
     Dim c As Object, s As Object
     Dim cc As Long, i As Long, sc As Long, j As Long
     cc = SapChildCount(app)
@@ -328,8 +328,8 @@ Private Function SapFindSessionByTCode(app As Object, sysPrefix As String, Clien
         sc = SapChildCount(c)
         For j = 0 To sc - 1
             Set s = SapGetChild(c, j)
-            If SapMatchSystem(s, sysPrefix) And SapMatchClient(s, ClientExact) Then
-                If UCase$(SafeStr(s.Info.Transaction)) = UCase$(TCode) Then
+            If SapMatchSystem(s, sysPrefix) And SapMatchClient(s, clientExact) Then
+                If UCase$(SafeStr(s.Info.Transaction)) = UCase$(tcode) Then
                     Set SapFindSessionByTCode = s
                     Exit Function
                 End If
@@ -341,7 +341,7 @@ End Function
 
 ' Find a connection whose sessions match System/Client; else fall back to
 ' a connection whose Description contains the SystemPrefix.
-Private Function SapFindConnection(app As Object, sysPrefix As String, ClientExact As String) As Object
+Private Function SapFindConnection(app As Object, sysPrefix As String, clientExact As String) As Object
     Dim c As Object, s As Object
     Dim cc As Long, i As Long, sc As Long, j As Long
     cc = SapChildCount(app)
@@ -350,7 +350,7 @@ Private Function SapFindConnection(app As Object, sysPrefix As String, ClientExa
         sc = SapChildCount(c)
         For j = 0 To sc - 1
             Set s = SapGetChild(c, j)
-            If SapMatchSystem(s, sysPrefix) And SapMatchClient(s, ClientExact) Then
+            If SapMatchSystem(s, sysPrefix) And SapMatchClient(s, clientExact) Then
                 Set SapFindConnection = c
                 Exit Function
             End If
@@ -380,11 +380,11 @@ End Function
 
 
 ' Does this session’s client equal ClientExact (if provided)?
-Private Function SapMatchClient(s As Object, ClientExact As String) As Boolean
-    If Len(ClientExact) = 0 Then
+Private Function SapMatchClient(s As Object, clientExact As String) As Boolean
+    If Len(clientExact) = 0 Then
         SapMatchClient = True
     Else
-        SapMatchClient = (Trim$(CStr(s.Info.client)) = Trim$(ClientExact))
+        SapMatchClient = (Trim$(CStr(s.Info.Client)) = Trim$(clientExact))
     End If
 End Function
 
@@ -861,5 +861,60 @@ Public Sub SapWaitIdle(ByVal s As Object, Optional ByVal seconds As Double = 0#)
         End If
     Loop
 End Sub
+
+
+'===========================
+' 1) Reuse MIRO session *as-is* (no /n, no /o, no refresh)
+'===========================
+Public Function SapGetExistingSessionOnTCode( _
+    ByVal systemPrefix As String, _
+    ByVal clientExact As String, _
+    ByVal tcode As String, _
+    Optional ByVal ShowStatus As Boolean = False _
+) As Object
+    Dim app As Object, ses As Object
+    Set app = SapGetApp()
+    If app Is Nothing Then Exit Function
+
+    ' Only reuse; do NOT open new and do NOT reset
+    Set ses = SapFindSessionByTCode(app, systemPrefix, clientExact, tcode)
+    If ses Is Nothing Then Exit Function
+
+    On Error Resume Next
+    ses.findById("wnd[0]").Maximize
+    SapTryDismissPopup ses
+    On Error GoTo 0
+
+    If ShowStatus Then
+        Application.StatusBar = "SAP · Reused existing " & UCase$(tcode) & _
+            " | Sys=" & SafeStr(ses.Info.SystemName) & _
+            " / Client=" & SafeStr(ses.Info.Client)
+    End If
+    Set SapGetExistingSessionOnTCode = ses
+End Function
+
+'===========================
+' 2) MIRO: ensure header is collapsed (no-op if already collapsed)
+'    Uses the standard toggle buttons if present.
+'===========================
+Public Sub MiroEnsureHeaderCollapsed(ByVal ses As Object)
+    On Error Resume Next
+    ' If collapse button exists → header is expanded → collapse it.
+    If SapExistsId(ses, "wnd[0]/usr/btnRM08M-HEADER_COLLAPSE") Then
+        ses.findById("wnd[0]/usr/btnRM08M-HEADER_COLLAPSE").press
+        SapWaitIdle ses, 0.2
+        Exit Sub
+    End If
+    ' If only expand exists, header is already collapsed → do nothing.
+    ' ("wnd[0]/usr/btnRM08M-HEADER_EXPAND")
+End Sub
+
+'===========================
+' (Optional) Sanity check: assert current TCode without resetting
+'===========================
+Public Function SapAssertOnTCode_NoReset(ByVal ses As Object, ByVal tcode As String) As Boolean
+    On Error Resume Next
+    SapAssertOnTCode_NoReset = (StrComp(CStr(ses.Info.Transaction), UCase$(tcode), vbTextCompare) = 0)
+End Function
 
 
