@@ -175,16 +175,31 @@ Public Sub SD_Post_MIRO_FromSD()
             Exit Sub
         End If
         
-        ' ===== F) Post (F11) =====
+        ' ===== F) Post (F11 부가세 없이) =====
+        'Dbg "Ready to post Row " & r & ". Current focus = " & GetGuiFocusId(ses)
+        
+        'ses.findById("wnd[0]").sendVKey 11
+        'Call SapWaitIdle(ses, 1#)
+        'SapTryDismissPopup ses
+        
+        ' next row
+        'GoTo NextRow
+        
+        ' ===== F) Post (F11 10%아닌 부가세 포함할 시) =====
         Dbg "Ready to post Row " & r & ". Current focus = " & GetGuiFocusId(ses)
 
         ses.findById("wnd[0]").sendVKey 11
         Call SapWaitIdle(ses, 1#)
         SapTryDismissPopup ses
-
-        ' next row
+        SapWaitIdle ses, 0.2
+        
+        ' 3) ***추가***: 한 번 더 Enter 쳐서 다음 행으로 넘어가기
+        ses.findById("wnd[0]").sendVKey 0
+        SapWaitIdle ses, 0.2
+      
+        
+        ' 다음 엑셀 행으로
         GoTo NextRow
-
 FatalStop:
     Dim t As String, m As String
     SD_GetStatusBar ses, t, m
