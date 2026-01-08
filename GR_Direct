@@ -1,0 +1,187 @@
+Option Explicit
+' Requires: modSAP
+
+' ==============================================================================
+' CONFIGURATION
+' ==============================================================================
+Private Const XL_SHEET_QUEUE      As String = "Queue"
+Private Const XL_COL_PO           As String = "D"
+Private Const XL_COL_ITEM         As String = "E" ' If value exists here, we enter it.
+Private Const XL_START_ROW        As Long = 7
+Private Const XL_STOP_ROW_LIMIT   As Long = 7
+
+' SAP IDs
+Private Const ID_TBL_MIGO         As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMLIST:SAPLMIGO:0200/tblSAPLMIGOTV_GOITEM"
+Private Const ID_PO_FIELD         As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_FIRSTLINE:SAPLMIGO:0010/subSUB_FIRSTLINE_REFDOC:SAPLMIGO:2000/ctxtGODYNPRO-PO_NUMBER"
+
+' ** UPDATED: This is the Item Field ID you provided **
+Private Const ID_ITEM_FIELD       As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_FIRSTLINE:SAPLMIGO:0010/subSUB_FIRSTLINE_REFDOC:SAPLMIGO:2000/txtGODYNPRO-PO_ITEM"
+
+Private Const ID_HEADER_TXT       As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_HEADER:SAPLMIGO:0101/subSUB_HEADER:SAPLMIGO:0100/tabsTS_GOHEAD/tabpOK_GOHEAD_GENERAL/ssubSUB_TS_GOHEAD_GENERAL:SAPLMIGO:0110/txtGOHEAD-BKTXT"
+
+' Detail View IDs
+Private Const ID_TAB_DEST         As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/tabsTS_GOITEM/tabpOK_GOITEM_DESTINAT."
+Private Const ID_DETAIL_TXT       As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/tabsTS_GOITEM/tabpOK_GOITEM_DESTINAT./ssubSUB_TS_GOITEM_DESTINATION:SAPLMIGO:0325/txtGOITEM-SGTXT"
+Private Const ID_DETAIL_OK        As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/subSUB_DETAIL_TAKE:SAPLMIGO:0304/chkGODYNPRO-DETAIL_TAKE"
+
+Public Sub Process_MIGO_Restart_Every_Time()
+    Dim ses As Object
+    Set ses = modSAP.SapGetSessionByTCode("P10", "", "MIGO", True, False, True)
+    
+    If ses Is Nothing Then
+        MsgBox "Could not access SAP MIGO session.", vbCritical
+        Exit Sub
+    End If
+
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(XL_SHEET_QUEUE)
+    On Error GoTo 0
+    If ws Is Nothing Then MsgBox "Sheet '" & XL_SHEET_QUEUE & "' not found.", vbCritical: Exit Sub
+
+    Dim r As Long, lastRow As Long
+    Dim poNum As String, poItem As String
+    
+    If XL_STOP_ROW_LIMIT > 0 Then
+        lastRow = XL_STOP_ROW_LIMIT
+    Else
+        lastRow = ws.Cells(ws.Rows.Count, XL_COL_PO).End(xlUp).row
+    End If
+    
+    ' --- LOOP EXCEL ---
+    For r = XL_START_ROW To lastRow
+        poNum = Trim(CStr(ws.Range(XL_COL_PO & r).value))
+        poItem = Trim(CStr(ws.Range(XL_COL_ITEM & r).value))
+        
+        If poNum <> "" Then
+            Application.StatusBar = "Processing Row " & r & " (PO: " & poNum & " Item: " & poItem & ")"
+            
+            ' A. RESTART MIGO (/n)
+            ses.findById("wnd[0]/tbar[0]/okcd").Text = "/nMIGO"
+            ses.findById("wnd[0]").sendVKey 0
+            
+            ' B. WAIT
+            If Not modSAP.SapWaitForId(ses, ID_PO_FIELD, 10) Then
+                MsgBox "Timeout waiting for MIGO to reset at PO " & poNum, vbCritical
+                Exit Sub
+            End If
+            
+            ' C. PROCESS
+            Call Process_Single_PO(ses, poNum, poItem)
+        End If
+    Next r
+    
+    Application.StatusBar = ""
+    MsgBox "Queue processing complete.", vbInformation
+End Sub
+
+Private Sub Process_Single_PO(ses As Object, poNum As String, poItem As String)
+    On Error Resume Next
+    
+    ' --- STEP 1: ENTER PO NUMBER ---
+    ses.findById(ID_PO_FIELD).Text = poNum
+    
+    ' --- STEP 2: ENTER ITEM NUMBER (CONDITIONAL) ---
+    If poItem <> "" Then
+        ' If Excel has "10", we type "10" here. SAP will filter the grid.
+        ses.findById(ID_ITEM_FIELD).Text = poItem
+    Else
+        ' If Excel is blank, we ensure this field is blank so SAP shows ALL items.
+        ses.findById(ID_ITEM_FIELD).Text = ""
+    End If
+    
+    ' Send Enter to load data
+    ses.findById("wnd[0]").sendVKey 0
+    SleepMs 1000
+    
+    ' Copy PO to Header Text
+    ses.findById(ID_HEADER_TXT).Text = poNum
+    
+    ' --- STEP 3: FIND GRID ---
+    If Not modSAP.SapWaitForId(ses, ID_TBL_MIGO, 5) Then Exit Sub
+    
+    Dim tblObj As Object
+    Set tblObj = ses.findById(ID_TBL_MIGO)
+
+    ' Safe Page Size (Small enough to ensure visibility)
+    Dim pageRows As Long
+    pageRows = 6
+    
+    Dim k As Long, localRow As Long
+    Dim maxItems As Long: maxItems = 150
+    Dim lineText As String
+    Dim rawText As String
+    
+    ' --- STEP 4: LOOP GRID ---
+    ' If Item Number was entered, this loop will likely only run once (k=0).
+    ' If Item Number was blank, it will loop through all lines.
+    For k = 0 To maxItems
+        localRow = k Mod pageRows
+        
+        ' Paging Logic
+        If (k > 0) And (localRow = 0) Then
+            tblObj.VerticalScrollbar.Position = k
+            ses.findById("wnd[0]").sendVKey 0
+            SleepMs 600
+            Set tblObj = ses.findById(ID_TBL_MIGO)
+        End If
+        
+        ' --- STOP CONDITION ---
+        rawText = ""
+        ' Get Text from Column 7 (Description)
+        rawText = ses.findById(ID_TBL_MIGO & "/ctxtGOITEM-MAKTX[7," & localRow & "]").Text
+        
+        ' Check if empty or underscores
+        If IsSapEmpty(rawText) Then Exit For
+        
+        ' --- ACTION ---
+        
+        ' Clean Text
+        lineText = CleanSapText(rawText)
+        Debug.Print "Row " & k & " Processing: " & lineText
+        
+        ' A. Click Row Button
+        Dim btnRow As Object
+        Set btnRow = ses.findById(ID_TBL_MIGO & "/btnGOITEM-ZEILE[0," & localRow & "]")
+        If btnRow Is Nothing Then Exit For
+        
+        btnRow.SetFocus
+        btnRow.press
+        SleepMs 700
+        
+        ' B. Click Destination Tab
+        ses.findById(ID_TAB_DEST).Select
+        SleepMs 500
+        
+        ' C. Paste Text
+        Call modSAP.SapSafeSetText(ses, ID_DETAIL_TXT, lineText, 2)
+        
+        ' D. Check "Item OK"
+        ses.findById(ID_DETAIL_OK).Selected = True
+        SleepMs 200
+        
+    Next k
+    
+    On Error GoTo 0
+End Sub
+
+' --- Helpers ---
+
+Private Function IsSapEmpty(val As String) As Boolean
+    Dim temp As String
+    temp = Replace(val, "_", "")
+    temp = Trim(temp)
+    IsSapEmpty = (Len(temp) = 0)
+End Function
+
+Private Function CleanSapText(val As String) As String
+    CleanSapText = Replace(val, "_", "")
+    CleanSapText = Trim(CleanSapText)
+End Function
+
+Private Sub SleepMs(ByVal ms As Long)
+    Dim t As Double: t = Timer
+    Do While (Timer - t) * 1000 < ms
+        DoEvents
+    Loop
+End Sub
