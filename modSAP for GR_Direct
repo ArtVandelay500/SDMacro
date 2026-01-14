@@ -1,0 +1,922 @@
+Option Explicit
+' =====================================================================
+' modSAP ? Reusable SAP GUI helpers (WIP-safe, TCode-first)
+'
+' What this module does:
+' - Finds/reuses an SAP session already on a specific TCode, or opens a new
+'   window (/o<TCode>) without disturbing other windows you’re working in.
+' - Optionally forces a clean screen (/n<TCode>) so every run starts from
+'   the same UI state (useful when the same TCode has multiple screens).
+' - Offers fast and safe ways to find and set controls by their **TechID**.
+' - Dumps all editable controls to a worksheet so you can discover the
+'   exact IDs/Suffixes to use in your business logic.
+' - Uses safe child access everywhere (prevents “bad index type” errors).
+'
+' Glossary:
+' - TechID: SAP’s internal control path like
+'   "wnd[0]/usr/tabsTABSTRIP_ENTRY/.../ctxtS_BUKRSH-LOW"
+' - Suffix: The end of a TechID (the part after the last "/"), e.g.
+'   "ctxtS_BUKRSH-LOW". Suffixes are stable and great for reuse.
+' - Token: A short text you search for inside a TechID (e.g. "BUKRS",
+'   "tabpUCOMM"). Tokens are useful when you don’t know the full ID or
+'   suffix yet; you’re looking for “IDs that contain this substring”.
+' =====================================================================
+
+
+' ---------------------------
+' Public: get a session on a TCode (clean start)
+' ---------------------------
+' PURPOSE:
+'   Get an SAP session connected to a given System/Client/TCode.
+'   If a session on that TCode exists, we reuse it (optionally /n to reset).
+'   Otherwise, we open a new window (/o<TCode>) in a matching connection.
+'
+' PARAMETERS:
+'   SystemPrefix  - e.g. "P10". Blank "" means “any system”.
+'   ClientExact   - e.g. "010". Blank "" means “any client”.
+'   TCode         - e.g. "Z114_FIDOC".
+'   PreferReuse   - If True, try to reuse an existing session on this TCode.
+'   ResetOnReuse  - If True, force a clean screen with /n<TCode>.
+'   ShowStatus    - If True, writes status to the Excel status bar.
+'
+' RETURNS:
+'   The SAP session object, or Nothing if unavailable.
+Public Function SapGetSessionByTCode( _
+    ByVal systemPrefix As String, _
+    ByVal clientExact As String, _
+    ByVal tcode As String, _
+    Optional ByVal PreferReuse As Boolean = True, _
+    Optional ByVal ResetOnReuse As Boolean = True, _
+    Optional ByVal ShowStatus As Boolean = False _
+) As Object
+
+    Dim app As Object, con As Object, ses As Object
+    Dim beforeCnt As Long, mode As String
+
+    Set app = SapGetApp()
+    If app Is Nothing Then
+        If ShowStatus Then MsgBox "SAP GUI not running or scripting disabled.", vbCritical, "SAP"
+        Exit Function
+    End If
+
+    ' 1) Reuse a session already on the TCode (don’t touch other windows)
+    If PreferReuse Then
+        Set ses = SapFindSessionByTCode(app, systemPrefix, clientExact, tcode)
+        If Not ses Is Nothing Then
+            mode = "Reused"
+            ' Always reset to a clean screen if asked (even if already same TCode)
+            If ResetOnReuse Then
+                On Error Resume Next
+                ses.findById("wnd[0]/tbar[0]/okcd").Text = "/n" & UCase$(tcode)
+                ses.findById("wnd[0]").sendVKey 0
+                On Error GoTo 0
+            End If
+            GoTo Ready
+        End If
+    End If
+
+    ' 2) Find a matching connection and open /o<TCode> in a NEW window
+    Set con = SapFindConnection(app, systemPrefix, clientExact)
+    If con Is Nothing Then
+        ' If no existing connection matches, try to open by SystemPrefix (SAP Logon entry name)
+        On Error Resume Next
+        Set con = app.OpenConnection(systemPrefix, True)
+        On Error GoTo 0
+        If con Is Nothing Then
+            If ShowStatus Then MsgBox "No active connection for '" & systemPrefix & _
+               IIf(Len(clientExact) > 0, "' client " & clientExact, "'") & ".", vbExclamation, "SAP"
+            Exit Function
+        End If
+    End If
+
+    ' Use any session in the connection to run the /o command (opens TCode in a **new window**)
+    Dim ref As Object
+    Set ref = SapGetChild(con, 0)
+    beforeCnt = SapChildCount(con)
+    ref.findById("wnd[0]/tbar[0]/okcd").Text = "/o" & UCase$(tcode)
+    ref.findById("wnd[0]").sendVKey 0
+
+    ' Wait until the new session exists
+    If Not SapWaitSessionCount(con, beforeCnt + 1, 8#) Then
+        If ShowStatus Then MsgBox "Timeout creating /o" & tcode & ".", vbCritical, "SAP"
+        Exit Function
+    End If
+
+    ' Use the newest session
+    Set ses = SapGetChild(con, SapChildCount(con) - 1)
+    mode = "Opened new"
+
+Ready:
+    If ses Is Nothing Then Exit Function
+    On Error Resume Next
+    ses.findById("wnd[0]").maximize
+    SapTryDismissPopup ses
+    On Error GoTo 0
+
+    If ShowStatus Then
+        Application.StatusBar = "SAP ? " & mode & " | Sys=" & SafeStr(ses.Info.SystemName) & _
+            " / Client=" & SafeStr(ses.Info.Client) & " / T=" & SafeStr(ses.Info.Transaction)
+    End If
+
+    Set SapGetSessionByTCode = ses
+End Function
+
+
+' Force-clean the screen for a TCode and wait for a tabstrip to exist
+' PURPOSE:
+'   Guarantees a “known good” starting UI for a TCode by sending /n<TCode>
+'   and then waiting until the screen shows a tabstrip (common anchor).
+'
+' PARAMETERS:
+'   sess        - The SAP session we’re working in.
+'   TCode       - The transaction code to reset to.
+'   timeoutSec  - How long to wait for the tabstrip anchor.
+'
+' RETURNS:
+'   True if a tabstrip (an ID containing "tabsTABSTRIP") was detected in time.
+Public Function SapEnsureOnTCode(ByVal sess As Object, ByVal tcode As String, _
+                                 Optional ByVal timeoutSec As Double = 8#) As Boolean
+    On Error Resume Next
+    sess.findById("wnd[0]/tbar[0]/okcd").Text = "/n" & UCase$(tcode)
+    sess.findById("wnd[0]").sendVKey 0
+    Err.Clear
+
+    ' Wait for any tabstrip anchor to appear (IDs containing "tabsTABSTRIP")
+    SapEnsureOnTCode = SapWaitForIdContains(sess, "tabsTABSTRIP", timeoutSec)
+End Function
+
+
+' ---------------------------
+' Fast, targeted control helpers
+' ---------------------------
+
+' Find by suffix under a known container (faster than scanning full window)
+' PURPOSE:
+'   Look only beneath a specific container (e.g. "wnd[0]/usr/tabsTABSTRIP_ENTRY")
+'   for a control whose TechID ends with a given suffix.
+'
+' PARAMETERS:
+'   sess        - SAP session.
+'   rootFullId  - Full TechID of the parent container you want to search under.
+'   suffix      - The ending part of the TechID you expect (e.g. "ctxtS_BUKRSH-LOW").
+'
+' RETURNS:
+'   The control object if found, else Nothing.
+Public Function SapFindByIdSuffixUnder(ByVal sess As Object, ByVal rootFullId As String, ByVal suffix As String) As Object
+    Dim root As Object
+    On Error Resume Next
+    Set root = sess.findById(rootFullId)
+    On Error GoTo 0
+    If root Is Nothing Then Exit Function
+    Set SapFindByIdSuffixUnder = SapFindByIdSuffix_Recur(root, suffix)
+End Function
+
+
+' Select a tab by suffix under a known tabstrip container
+' PURPOSE:
+'   Click a tab whose ID ends with the given suffix, but search **only**
+'   within the provided tabstrip container (fast and reliable).
+'
+' PARAMETERS:
+'   sess         - SAP session.
+'   tabstripRoot - Full TechID of the tabstrip container (e.g. "wnd[0]/usr/tabsTABSTRIP_ENTRY").
+'   tabSuffix    - Suffix of the tab page (e.g. "tabpUCOMM_HD").
+'
+' RETURNS:
+'   True if the tab was found and selected.
+Public Function SapSelectTabByIdSuffixUnder(ByVal sess As Object, ByVal tabstripRoot As String, ByVal tabSuffix As String) As Boolean
+    Dim tabObj As Object
+    Set tabObj = SapFindByIdSuffixUnder(sess, tabstripRoot, tabSuffix)
+    If tabObj Is Nothing Then Exit Function
+    On Error Resume Next
+    tabObj.Select
+    SapSelectTabByIdSuffixUnder = (Err.Number = 0)
+    Err.Clear
+End Function
+
+
+' Try fullId first (fast path), else fallback to suffix lookup
+' PURPOSE:
+'   Best-effort setter for text fields:
+'   1) If you know the full TechID, try that (fastest).
+'   2) If that fails, try by suffix scan across window (robust).
+'
+' PARAMETERS:
+'   sess   - SAP session.
+'   fullId - Full TechID (may be "" if unknown).
+'   suffix - Suffix to fall back to if fullId fails.
+'   value  - Text to write into the field.
+'
+' RETURNS:
+'   True if the field was set successfully.
+Public Function SapSetTextFast(ByVal sess As Object, ByVal fullId As String, ByVal suffix As String, ByVal value As String) As Boolean
+    On Error Resume Next
+    If Len(fullId) > 0 Then
+        sess.findById(fullId).Text = value
+        If Err.Number = 0 Then SapSetTextFast = True: Err.Clear: Exit Function
+        Err.Clear
+    End If
+    SapSetTextFast = SapSetTextByIdSuffix(sess, suffix, value)
+End Function
+
+
+' Set text by TechID suffix (searches whole window)
+' PURPOSE:
+'   Find a control whose TechID ends with a given suffix and set its Text.
+'   Useful when you don’t have a full TechID but do know the stable suffix.
+Public Function SapSetTextByIdSuffix(ByVal sess As Object, ByVal suffix As String, ByVal value As String) As Boolean
+    Dim ctl As Object
+    Set ctl = SapFindByIdSuffixFullWindow(sess, suffix)
+    If Not ctl Is Nothing Then
+        On Error Resume Next
+        ctl.Text = value
+        SapSetTextByIdSuffix = (Err.Number = 0)
+        Err.Clear
+    End If
+End Function
+
+
+' For combo boxes: set Key by searching for **tokens** in their TechID
+' PURPOSE:
+'   If the field is a dropdown (GuiComboBox), set .Key instead of .Text.
+'   We first locate the control by searching for **tokens** in its TechID.
+'
+' What is a token?
+'   A token is just a substring you expect to appear in the TechID. For
+'   example, "BUKRS" or "-LOW". We search for any control whose ID **contains**
+'   these strings. It’s helpful when you don’t know the exact suffix yet.
+'
+' PARAMETERS:
+'   sess   - SAP session.
+'   tokens - Variant array of one or more strings to look for in the TechID
+'            (e.g. Array("BUKRS","-LOW")).
+'   key    - The key value to select in the combo box.
+'
+' RETURNS:
+'   True if we found a control and set its Key.
+Public Function SapSetKeyByIdContains(ByVal sess As Object, ByVal tokens As Variant, ByVal key As String) As Boolean
+    Dim root As Object: Set root = sess.findById("wnd[0]")
+    Dim ctl As Object: Set ctl = SapFindByIdContains(root, tokens)
+    If Not ctl Is Nothing Then
+        On Error Resume Next
+        ctl.key = key
+        SapSetKeyByIdContains = (Err.Number = 0)
+        Err.Clear
+    End If
+End Function
+
+
+' Press a button by TechID suffix (tries main window then popup)
+' PURPOSE:
+'   Click a button when you only know its suffix. We scan the main window;
+'   if not found and a popup exists (wnd[1]), we scan the popup too.
+Public Function SapPressButtonByIdSuffix(ByVal sess As Object, ByVal suffix As String) As Boolean
+    Dim ctl As Object
+    Set ctl = SapFindByIdSuffixFullWindow(sess, suffix)
+    If ctl Is Nothing And SapExistsId(sess, "wnd[1]/usr") Then
+        Dim pop As Object: Set pop = sess.findById("wnd[1]/usr")
+        Set ctl = SapFindByIdSuffix_Recur(pop, suffix)
+    End If
+    If Not ctl Is Nothing Then
+        On Error Resume Next
+        ctl.Press
+        SapPressButtonByIdSuffix = (Err.Number = 0)
+        Err.Clear
+    End If
+End Function
+
+
+' Set a checkbox by TechID suffix
+' PURPOSE:
+'   Find a checkbox by suffix anywhere in the current window and set its
+'   .Selected state to True/False.
+Public Function SapSetCheckboxByIdSuffix(ByVal sess As Object, ByVal suffix As String, ByVal checked As Boolean) As Boolean
+    Dim ctl As Object
+    Set ctl = SapFindByIdSuffixFullWindow(sess, suffix)
+    If Not ctl Is Nothing Then
+        On Error Resume Next
+        ctl.Selected = checked
+        SapSetCheckboxByIdSuffix = (Err.Number = 0)
+        Err.Clear
+    End If
+End Function
+
+
+' ---------------------------
+' App / connections / sessions
+' ---------------------------
+
+' Get the SAP GUI scripting engine (root object)
+' RETURNS:
+'   The scripting engine or Nothing if SAP GUI isn’t running / scripting off.
+Private Function SapGetApp() As Object
+    On Error Resume Next
+    Dim g As Object: Set g = GetObject("SAPGUI")
+    If Not g Is Nothing Then Set SapGetApp = g.GetScriptingEngine
+End Function
+
+
+' Find an already-open session that matches System/Client and is on TCode.
+' RETURNS:
+'   The session object if found, else Nothing.
+Private Function SapFindSessionByTCode(app As Object, sysPrefix As String, clientExact As String, tcode As String) As Object
+    Dim c As Object, s As Object
+    Dim cc As Long, i As Long, sc As Long, j As Long
+    cc = SapChildCount(app)
+    For i = 0 To cc - 1
+        Set c = SapGetChild(app, i)
+        sc = SapChildCount(c)
+        For j = 0 To sc - 1
+            Set s = SapGetChild(c, j)
+            If SapMatchSystem(s, sysPrefix) And SapMatchClient(s, clientExact) Then
+                If UCase$(SafeStr(s.Info.Transaction)) = UCase$(tcode) Then
+                    Set SapFindSessionByTCode = s
+                    Exit Function
+                End If
+            End If
+        Next j
+    Next i
+End Function
+
+
+' Find a connection whose sessions match System/Client; else fall back to
+' a connection whose Description contains the SystemPrefix.
+Private Function SapFindConnection(app As Object, sysPrefix As String, clientExact As String) As Object
+    Dim c As Object, s As Object
+    Dim cc As Long, i As Long, sc As Long, j As Long
+    cc = SapChildCount(app)
+    For i = 0 To cc - 1
+        Set c = SapGetChild(app, i)
+        sc = SapChildCount(c)
+        For j = 0 To sc - 1
+            Set s = SapGetChild(c, j)
+            If SapMatchSystem(s, sysPrefix) And SapMatchClient(s, clientExact) Then
+                Set SapFindConnection = c
+                Exit Function
+            End If
+        Next j
+        If SapFindConnection Is Nothing Then
+            On Error Resume Next
+            If Len(sysPrefix) > 0 And InStr(1, UCase$(c.Description), UCase$(sysPrefix)) > 0 Then
+                Set SapFindConnection = c
+                Err.Clear
+                Exit Function
+            End If
+            On Error GoTo 0
+        End If
+    Next i
+End Function
+
+
+' Does this session belong to the system whose name starts with / contains sysPrefix?
+Private Function SapMatchSystem(s As Object, sysPrefix As String) As Boolean
+    If Len(sysPrefix) = 0 Then SapMatchSystem = True: Exit Function
+    On Error Resume Next
+    Dim sys As String: sys = Trim$(CStr(s.Info.SystemName))
+    If Len(sys) = 0 Then sys = Trim$(CStr(s.parent.Description))
+    SapMatchSystem = (Left$(UCase$(sys), Len(sysPrefix)) = UCase$(sysPrefix)) Or _
+                     (InStr(1, UCase$(sys), UCase$(sysPrefix)) > 0)
+End Function
+
+
+' Does this session’s client equal ClientExact (if provided)?
+Private Function SapMatchClient(s As Object, clientExact As String) As Boolean
+    If Len(clientExact) = 0 Then
+        SapMatchClient = True
+    Else
+        SapMatchClient = (Trim$(CStr(s.Info.Client)) = Trim$(clientExact))
+    End If
+End Function
+
+
+' Wait until the number of sessions (windows) in a connection reaches targetCount
+' RETURNS:
+'   True if reached in time, False if timed out.
+Private Function SapWaitSessionCount(con As Object, ByVal targetCount As Long, Optional ByVal timeoutSec As Double = 6#) As Boolean
+    Dim deadline As Single: deadline = Timer + timeoutSec
+    Do
+        DoEvents
+        If SapChildCount(con) >= targetCount Then SapWaitSessionCount = True: Exit Function
+        If Timer > deadline Then Exit Do
+    Loop
+End Function
+
+
+'' --------------------------------------------------------------------
+' Close up to 3 chained popups (safe for MIRO)
+' --------------------------------------------------------------------
+Public Sub SapTryDismissPopup(ByVal ses As Object)
+    On Error Resume Next
+    Dim i As Long, btn As Object
+
+    For i = 1 To 3   ' handle up to 3 layers
+        If Not SapExistsId(ses, "wnd[1]") Then Exit For
+
+        ' Prefer the OK / Yes button
+        Set btn = Nothing
+        Err.Clear
+        Set btn = ses.findById("wnd[1]/tbar[0]/btn[0]")
+        If Not btn Is Nothing Then
+            btn.Press
+        Else
+            ' fallback: Cancel / ESC
+            Set btn = Nothing
+            On Error Resume Next
+            Set btn = ses.findById("wnd[1]/tbar[0]/btn[12]")
+            If Not btn Is Nothing Then btn.Press
+            On Error GoTo 0
+        End If
+
+        SapWaitIdle ses, 0.25
+    Next i
+    On Error GoTo 0
+End Sub
+
+
+' Safe existence check for a full TechID (no error if missing)
+Public Function SapExistsId(ByVal sess As Object, ByVal fullId As String) As Boolean
+    On Error Resume Next
+    Dim o As Object: Set o = sess.findById(fullId)
+    SapExistsId = (Err.Number = 0 And Not o Is Nothing)
+    Err.Clear
+End Function
+
+
+' Convert Variant safely to string (avoids type errors)
+Private Function SafeStr(v As Variant) As String
+    On Error Resume Next
+    SafeStr = CStr(v)
+End Function
+
+
+' ---------------------------
+' Safe child access
+' ---------------------------
+
+' Get number of children safely (prevents “bad index type” errors)
+Private Function SapChildCount(ByVal comp As Object) As Long
+    On Error Resume Next
+    SapChildCount = comp.Children.Count
+    If Err.Number <> 0 Then SapChildCount = 0
+    Err.Clear
+End Function
+
+' Get the i-th child safely (returns Nothing on error)
+Private Function SapGetChild(ByVal comp As Object, ByVal idx As Long) As Object
+    On Error Resume Next
+    Set SapGetChild = comp.Children.Item(CLng(idx))
+    If Err.Number <> 0 Then Set SapGetChild = Nothing
+    Err.Clear
+End Function
+
+' True if component has at least one child
+Private Function SapHasChildren(ByVal comp As Object) As Boolean
+    SapHasChildren = (SapChildCount(comp) > 0)
+End Function
+
+
+' ---------------------------
+' Recursive finders
+' ---------------------------
+
+' Search the whole main window (wnd[0]) for an ID ending with suffix
+Private Function SapFindByIdSuffixFullWindow(ByVal sess As Object, ByVal suffix As String) As Object
+    Dim root As Object: Set root = sess.findById("wnd[0]")
+    Set SapFindByIdSuffixFullWindow = SapFindByIdSuffix_Recur(root, suffix)
+End Function
+
+' Depth-first search under "node" for ID ending with suffix
+Private Function SapFindByIdSuffix_Recur(ByVal node As Object, ByVal suffix As String) As Object
+    Dim cc As Long, i As Long, ch As Object, idText As String
+    cc = SapChildCount(node)
+    For i = 0 To cc - 1
+        Set ch = SapGetChild(node, i)
+        If Not ch Is Nothing Then
+            On Error Resume Next
+            idText = CStr(ch.id)
+            On Error GoTo 0
+            If Right$(idText, Len(suffix)) = suffix Then
+                Set SapFindByIdSuffix_Recur = ch
+                Exit Function
+            End If
+            If SapHasChildren(ch) Then
+                Set SapFindByIdSuffix_Recur = SapFindByIdSuffix_Recur(ch, suffix)
+                If Not SapFindByIdSuffix_Recur Is Nothing Then Exit Function
+            End If
+        End If
+    Next i
+End Function
+
+' ==============================================================
+' Helper: recursively search for a control whose TechID contains
+'         any of the provided substrings (e.g., "RM08M-EBELN").
+'         Returns the first matching object or Nothing if not found.
+' ==============================================================
+Public Function SapFindByIdContains(ByVal parent As Object, _
+                                    ByVal substrings As Variant) As Object
+    Dim child As Object
+    Dim subStr As Variant
+    Dim i As Long
+
+    On Error Resume Next
+
+    For Each child In parent.Children
+        Dim id As String
+        id = ""
+        On Error Resume Next
+        id = CStr(child.id)
+        On Error GoTo 0
+
+        For Each subStr In substrings
+            If InStr(1, id, CStr(subStr), vbTextCompare) > 0 Then
+                Set SapFindByIdContains = child
+                Exit Function
+            End If
+        Next subStr
+
+        ' Recursive descent into containers (subScreens, subs, etc.)
+        If child.Children.Count > 0 Then
+            Set SapFindByIdContains = SapFindByIdContains(child, substrings)
+            If Not SapFindByIdContains Is Nothing Then Exit Function
+        End If
+    Next child
+End Function
+
+
+
+' ---------------------------
+' Screen readiness helpers
+' ---------------------------
+
+' Wait until any ID in wnd[0] contains a specific token (substring)
+' Example tokens: "tabsTABSTRIP", "tabpUCOMM", "SUBSCREEN_ENTRY"
+Private Function SapWaitForIdContains(ByVal sess As Object, ByVal token As String, _
+                                      Optional ByVal timeoutSec As Double = 6#) As Boolean
+    Dim deadline As Single: deadline = Timer + timeoutSec
+    Do
+        If SapIdContainsExists(sess, token) Then SapWaitForIdContains = True: Exit Function
+        DoEvents
+        If Timer > deadline Then Exit Do
+    Loop
+End Function
+
+' Helper: does any control in wnd[0] have an ID containing the token?
+Private Function SapIdContainsExists(ByVal sess As Object, ByVal token As String) As Boolean
+    Dim root As Object: Set root = sess.findById("wnd[0]")
+    SapIdContainsExists = SapIdContainsExists_Recur(root, token)
+End Function
+
+' DFS for “ID contains token”
+Private Function SapIdContainsExists_Recur(ByVal node As Object, ByVal token As String) As Boolean
+    Dim cc As Long, i As Long, ch As Object, idText As String
+    cc = SapChildCount(node)
+    For i = 0 To cc - 1
+        Set ch = SapGetChild(node, i)
+        If Not ch Is Nothing Then
+            On Error Resume Next
+            idText = CStr(ch.id)
+            On Error GoTo 0
+            If InStr(1, idText, token, vbTextCompare) > 0 Then
+                SapIdContainsExists_Recur = True
+                Exit Function
+            End If
+            If SapHasChildren(ch) Then
+                If SapIdContainsExists_Recur(ch, token) Then
+                    SapIdContainsExists_Recur = True
+                    Exit Function
+                End If
+            End If
+        End If
+    Next i
+End Function
+
+
+' ---------------------------
+' Editable control dumper (for discovering params)
+' ---------------------------
+
+' PURPOSE:
+'   Scans wnd[0] and writes every editable control to a worksheet so the
+'   user can copy/paste the **Suffix** into your business code.
+'   Great for discovering the correct IDs on a new or changed screen.
+'
+' SHEET COLUMNS:
+'   Type, FullId, Suffix, CurrentValue, Hint (e.g. marks “BUK” candidates)
+Public Sub SapDumpEditableControlsToSheet(ByVal sess As Object, Optional ByVal sheetName As String = "SAP_EDITABLES")
+    Dim wb As Workbook, ws As Worksheet
+    Set wb = ThisWorkbook
+
+    On Error Resume Next
+    Set ws = wb.Worksheets(sheetName)
+    If ws Is Nothing Then
+        Set ws = wb.Worksheets.Add
+        ws.Name = sheetName
+    Else
+        ws.Cells.Clear
+    End If
+    On Error GoTo 0
+
+    ws.Range("A1:E1").value = Array("Type", "FullId", "Suffix", "CurrentValue", "Hint")
+    Dim row As Long: row = 2
+
+    Dim root As Object: Set root = sess.findById("wnd[0]")
+    Call SapWalkDumpEditables(root, ws, row)
+
+    ws.Columns.AutoFit
+    MsgBox "Editable controls listed on sheet '" & sheetName & "'. Use the Suffix column in your params.", vbInformation, "SAP"
+End Sub
+
+
+' Recursive walker used by the dumper above
+Private Sub SapWalkDumpEditables(ByVal node As Object, ByVal ws As Worksheet, ByRef row As Long)
+    Dim i As Long, ch As Object, cc As Long
+    cc = SapChildCount(node)
+    For i = 0 To cc - 1
+        Set ch = SapGetChild(node, i)
+        If Not ch Is Nothing Then
+            Dim typ As String, idt As String, cur As String, sfx As String, hint As String
+            On Error Resume Next
+            typ = CStr(ch.Type)
+            idt = CStr(ch.id)
+            On Error GoTo 0
+
+            ' Include only editables: text fields + combo boxes
+            If (InStr(1, typ, "GuiCTextField", vbTextCompare) > 0) Or _
+               (InStr(1, typ, "GuiTextField", vbTextCompare) > 0) Or _
+               (InStr(1, typ, "GuiComboBox", vbTextCompare) > 0) Then
+
+                sfx = SapGetSuffix(idt)
+
+                ' Read the “current value” appropriately
+                On Error Resume Next
+                If InStr(1, typ, "ComboBox", vbTextCompare) > 0 Then
+                    cur = CStr(ch.key)
+                Else
+                    cur = CStr(ch.Text)
+                End If
+                On Error GoTo 0
+
+                ' Tiny hint for “company code” candidates
+                If InStr(1, idt, "BUK", vbTextCompare) > 0 Then hint = "CompanyCode candidate"
+
+                ws.Cells(row, 1).value = typ
+                ws.Cells(row, 2).value = idt
+                ws.Cells(row, 3).value = sfx
+                ws.Cells(row, 4).value = cur
+                ws.Cells(row, 5).value = hint
+                row = row + 1
+            End If
+
+            If SapHasChildren(ch) Then SapWalkDumpEditables ch, ws, row
+        End If
+    Next i
+End Sub
+
+
+' Utility: return the trailing part (after the last "/") of a TechID
+Public Function SapGetSuffix(ByVal fullId As String) As String
+    Dim p As Long: p = InStrRev(fullId, "/")
+    If p > 0 Then SapGetSuffix = Mid$(fullId, p + 1) Else SapGetSuffix = fullId
+End Function
+
+' ======== modSAP: generic full-ID helpers (reusable) ========
+
+' Wait for a specific control (by full TechID) to exist.
+' PARAMETERS:
+'   sess       - SAP session object.
+'   fullId     - Full TechID to wait for, e.g. "wnd[0]/usr/ctxtINVFO-BLDAT".
+'   timeoutSec - Max seconds to wait (default 10).
+' RETURNS: True if found in time, False if not.
+Public Function SapWaitForId(ByVal sess As Object, ByVal fullId As String, _
+                             Optional ByVal timeoutSec As Double = 10#) As Boolean
+    Dim deadline As Single: deadline = Timer + timeoutSec
+    Do
+        On Error Resume Next
+        Dim o As Object: Set o = sess.findById(fullId)
+        If Err.Number = 0 And Not o Is Nothing Then
+            SapWaitForId = True
+            Err.Clear
+            Exit Function
+        End If
+        Err.Clear
+        DoEvents
+        If Timer > deadline Then Exit Do
+    Loop
+End Function
+
+' Set .Text by full TechID, waiting for control to exist.
+' RETURNS: True if set without error.
+Public Function SapSafeSetText(ByVal sess As Object, ByVal fullId As String, ByVal value As String, _
+                               Optional ByVal timeoutSec As Double = 10#) As Boolean
+    If Not SapWaitForId(sess, fullId, timeoutSec) Then Exit Function
+    On Error Resume Next
+    sess.findById(fullId).Text = value
+    SapSafeSetText = (Err.Number = 0)
+    Err.Clear
+End Function
+
+' Set .Key (for GuiComboBox) by full TechID, waiting first.
+' RETURNS: True if set without error.
+Public Function SapSafeSetKey(ByVal sess As Object, ByVal fullId As String, ByVal keyValue As String, _
+                              Optional ByVal timeoutSec As Double = 10#) As Boolean
+    If Not SapWaitForId(sess, fullId, timeoutSec) Then Exit Function
+    On Error Resume Next
+    sess.findById(fullId).key = keyValue
+    SapSafeSetKey = (Err.Number = 0)
+    Err.Clear
+End Function
+
+' Press a control (e.g., button) by full TechID, waiting first.
+' RETURNS: True if pressed without error.
+Public Function SapSafePress(ByVal sess As Object, ByVal fullId As String, _
+                             Optional ByVal timeoutSec As Double = 10#) As Boolean
+    If Not SapWaitForId(sess, fullId, timeoutSec) Then Exit Function
+    On Error Resume Next
+    sess.findById(fullId).Press
+    SapSafePress = (Err.Number = 0)
+    Err.Clear
+End Function
+
+' Is the target control present AND currently editable?
+' RETURNS: True if it exists and o.Changeable = True.
+Public Function SapIsChangeable(ByVal sess As Object, ByVal fullId As String) As Boolean
+    On Error Resume Next
+    Dim o As Object: Set o = sess.findById(fullId)
+    If Err.Number <> 0 Or o Is Nothing Then Err.Clear: Exit Function
+    SapIsChangeable = CBool(o.Changeable)
+End Function
+
+' Keep pressing Enter until a field becomes editable; then set it; then Enter again.
+' Useful when SAP requires intermediates steps/popups before the field is unlocked.
+' RETURNS: True if value set and confirmed; False on timeout.
+Public Function SapPressEnterUntilEditableThenSet(ByVal sess As Object, ByVal fullId As String, _
+                                                  ByVal value As String, _
+                                                  Optional ByVal maxTries As Long = 8) As Boolean
+    Dim i As Long
+    For i = 1 To maxTries
+        If SapExistsId(sess, fullId) And SapIsChangeable(sess, fullId) Then
+            On Error Resume Next
+            sess.findById(fullId).Text = value
+            If Err.Number = 0 Then
+                sess.findById("wnd[0]").sendVKey 0
+                SapTryDismissPopup sess  ' reuse your existing popup helper
+                SapPressEnterUntilEditableThenSet = True
+                Err.Clear
+                Exit Function
+            End If
+            Err.Clear
+        End If
+        sess.findById("wnd[0]").sendVKey 0
+        SapTryDismissPopup sess
+        DoEvents
+    Next i
+End Function
+
+' =========================
+' Company Code (BKPF-BUKRS) popup handler
+' =========================
+
+' Detects the first-time popup "wnd[1]/usr/ctxtBKPF-BUKRS" and fills a company code.
+' If companyCode is "", it will ask the user to choose 0252 or 0250.
+' Returns True if it handled a BKPF-BUKRS popup (or no popup), False only on failure to set when required.
+Public Function SapHandleBukrsPopup(ByVal sess As Object, Optional ByVal companyCode As String = "") As Boolean
+    On Error Resume Next
+
+    ' No popup → nothing to do (considered handled)
+    If Not SapExistsId(sess, "wnd[1]/usr/ctxtBKPF-BUKRS") Then
+        SapHandleBukrsPopup = True
+        Exit Function
+    End If
+
+    ' If caller didn’t pass a code, ask the user
+    If Len(Trim$(companyCode)) = 0 Then
+        companyCode = SapPickCompanyCode("0252") ' default choice if user just hits Enter
+        If Len(companyCode) = 0 Then
+            ' user canceled
+            SapHandleBukrsPopup = False
+            Exit Function
+        End If
+    End If
+
+    ' Validate only allowed values
+    companyCode = Trim$(companyCode)
+    If companyCode <> "0252" And companyCode <> "0250" Then
+        MsgBox "Company code must be 0252 or 0250.", vbExclamation, "SAP"
+        SapHandleBukrsPopup = False
+        Exit Function
+    End If
+
+    ' Fill BKPF-BUKRS and confirm
+    sess.findById("wnd[1]/usr/ctxtBKPF-BUKRS").Text = companyCode
+    sess.findById("wnd[1]").sendVKey 0   ' Enter/Continue
+    ' If another modal appears right away, try to clear it
+    Call SapTryDismissPopup(sess)
+
+    SapHandleBukrsPopup = True
+End Function
+
+' Simple two-option chooser for company code (Yes=0252, No=0250).
+' Returns "" if user cancels the MsgBox by closing the window (rare).
+Public Function SapPickCompanyCode(Optional ByVal defaultCode As String = "0252") As String
+    Dim resp As VbMsgBoxResult
+    Dim msg As String
+    msg = "Select Company Code:" & vbCrLf & _
+          "Yes  → 0252" & vbCrLf & _
+          "No   → 0250" & vbCrLf & vbCrLf & _
+          "Default: " & defaultCode
+    resp = MsgBox(msg, vbQuestion + vbYesNo, "Company Code")
+
+    If resp = vbYes Then
+        SapPickCompanyCode = "0252"
+    ElseIf resp = vbNo Then
+        SapPickCompanyCode = "0250"
+    Else
+        ' (shouldn’t happen with Yes/No, but keep a fallback)
+        SapPickCompanyCode = defaultCode
+    End If
+End Function
+
+' Wrapper to handle common popups: first try BKPF-BUKRS, otherwise OK/Yes buttons.
+' Returns True if something was handled (or nothing to handle), False if BKPF-BUKRS was required but failed.
+Public Function SapHandleCommonPopups(ByVal sess As Object, Optional ByVal companyCode As String = "") As Boolean
+    ' 1) The specific BKPF-BUKRS “first time of the day” popup
+    If SapExistsId(sess, "wnd[1]/usr/ctxtBKPF-BUKRS") Then
+        SapHandleCommonPopups = SapHandleBukrsPopup(sess, companyCode)
+        Exit Function
+    End If
+
+    ' 2) Generic popups (OK/Yes). Use your existing dismiss helper.
+    Call SapTryDismissPopup(sess)
+    SapHandleCommonPopups = True
+End Function
+
+Public Sub SapWaitIdle(ByVal s As Object, Optional ByVal seconds As Double = 0#)
+    On Error Resume Next
+    Dim t0 As Single: t0 = Timer
+    Do
+        DoEvents
+        If Not s.findById("wnd[0]").busy Then
+            If seconds <= 0# Then Exit Do
+            If Timer - t0 >= seconds Then Exit Do
+        End If
+    Loop
+End Sub
+
+
+'===========================
+' 1) Reuse MIRO session *as-is* (no /n, no /o, no refresh)
+'===========================
+Public Function SapGetExistingSessionOnTCode( _
+    ByVal systemPrefix As String, _
+    ByVal clientExact As String, _
+    ByVal tcode As String, _
+    Optional ByVal ShowStatus As Boolean = False _
+) As Object
+    Dim app As Object, ses As Object
+    Set app = SapGetApp()
+    If app Is Nothing Then Exit Function
+
+    ' Only reuse; do NOT open new and do NOT reset
+    Set ses = SapFindSessionByTCode(app, systemPrefix, clientExact, tcode)
+    If ses Is Nothing Then Exit Function
+
+    On Error Resume Next
+    ses.findById("wnd[0]").maximize
+    SapTryDismissPopup ses
+    On Error GoTo 0
+
+    If ShowStatus Then
+        Application.StatusBar = "SAP · Reused existing " & UCase$(tcode) & _
+            " | Sys=" & SafeStr(ses.Info.SystemName) & _
+            " / Client=" & SafeStr(ses.Info.Client)
+    End If
+    Set SapGetExistingSessionOnTCode = ses
+End Function
+
+'===========================
+' 2) MIRO: ensure header is collapsed (no-op if already collapsed)
+'    Uses the standard toggle buttons if present.
+'===========================
+Public Sub MiroEnsureHeaderCollapsed(ByVal ses As Object)
+    On Error Resume Next
+    ' If collapse button exists → header is expanded → collapse it.
+    If SapExistsId(ses, "wnd[0]/usr/btnRM08M-HEADER_COLLAPSE") Then
+        ses.findById("wnd[0]/usr/btnRM08M-HEADER_COLLAPSE").Press
+        SapWaitIdle ses, 0.2
+        Exit Sub
+    End If
+    ' If only expand exists, header is already collapsed → do nothing.
+    ' ("wnd[0]/usr/btnRM08M-HEADER_EXPAND")
+End Sub
+
+'===========================
+' (Optional) Sanity check: assert current TCode without resetting
+'===========================
+Public Function SapAssertOnTCode_NoReset(ByVal ses As Object, ByVal tcode As String) As Boolean
+    On Error Resume Next
+    SapAssertOnTCode_NoReset = (StrComp(CStr(ses.Info.Transaction), UCase$(tcode), vbTextCompare) = 0)
+End Function
+
+
+
+
