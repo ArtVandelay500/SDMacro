@@ -2,235 +2,222 @@ Option Explicit
 ' Requires: modSAP
 
 ' ==============================================================================
-' CONFIGURATION
+' EXCEL CONFIGURATION
 ' ==============================================================================
 Private Const XL_SHEET_QUEUE      As String = "Queue"
+Private Const CELL_START_ROW      As String = "E2"
+Private Const CELL_END_ROW        As String = "E3"
 
+' Data Columns
+Private Const XL_COL_STATUS        As String = "A"
+Private Const XL_COL_FILTER_SRC    As String = "B"
+Private Const XL_COL_PO            As String = "D"
+Private Const XL_COL_ITEM          As String = "E"
+Private Const XL_COL_DATE          As String = "J"
+Private Const XL_COL_DOC           As String = "K"
 
-' ** INPUT COLUMNS **
-Private Const XL_COL_FILTER       As String = "B" ' The Column to check (e.g. Currency/Type)
-Private Const XL_COL_PO           As String = "D"
-Private Const XL_COL_ITEM         As String = "E"
+' ==============================================================================
+' SAP CONFIGURATION
+' ==============================================================================
+Private Const ID_TBL_MIGO          As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMLIST:SAPLMIGO:0200/tblSAPLMIGOTV_GOITEM"
+Private Const ID_PO_FIELD          As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_FIRSTLINE:SAPLMIGO:0010/subSUB_FIRSTLINE_REFDOC:SAPLMIGO:2000/ctxtGODYNPRO-PO_NUMBER"
+Private Const ID_ITEM_FIELD        As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_FIRSTLINE:SAPLMIGO:0010/subSUB_FIRSTLINE_REFDOC:SAPLMIGO:2000/txtGODYNPRO-PO_ITEM"
+Private Const ID_HEADER_TXT        As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_HEADER:SAPLMIGO:0101/subSUB_HEADER:SAPLMIGO:0100/tabsTS_GOHEAD/tabpOK_GOHEAD_GENERAL/ssubSUB_TS_GOHEAD_GENERAL:SAPLMIGO:0110/txtGOHEAD-BKTXT"
 
-' ** FILTER SETTING **
-' Set to "CZK" or "CZVK" to only process those rows.
-' Leave as "" (Empty) to disable filtering (process all).
-Private Const XL_FILTER_KW        As String = "CZK"
-Private Const XL_START_ROW        As Long = 2
-Private Const XL_STOP_ROW_LIMIT   As Long = 0
-' ** OUTPUT COLUMNS **
-Private Const XL_COL_STATUS       As String = "A" ' READS & WRITES here
-Private Const XL_COL_DATE         As String = "I"
-Private Const XL_COL_DOC          As String = "J"
+Private Const ID_TAB_DEST          As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/tabsTS_GOITEM/tabpOK_GOITEM_DESTINAT."
+Private Const ID_DETAIL_TXT        As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/tabsTS_GOITEM/tabpOK_GOITEM_DESTINAT./ssubSUB_TS_GOITEM_DESTINATION:SAPLMIGO:0325/txtGOITEM-SGTXT"
+Private Const ID_DETAIL_OK         As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/subSUB_DETAIL_TAKE:SAPLMIGO:0304/chkGODYNPRO-DETAIL_TAKE"
 
-' SAP IDs
-Private Const ID_TBL_MIGO         As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMLIST:SAPLMIGO:0200/tblSAPLMIGOTV_GOITEM"
-Private Const ID_PO_FIELD         As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_FIRSTLINE:SAPLMIGO:0010/subSUB_FIRSTLINE_REFDOC:SAPLMIGO:2000/ctxtGODYNPRO-PO_NUMBER"
-Private Const ID_ITEM_FIELD       As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_FIRSTLINE:SAPLMIGO:0010/subSUB_FIRSTLINE_REFDOC:SAPLMIGO:2000/txtGODYNPRO-PO_ITEM"
-Private Const ID_HEADER_TXT       As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_HEADER:SAPLMIGO:0101/subSUB_HEADER:SAPLMIGO:0100/tabsTS_GOHEAD/tabpOK_GOHEAD_GENERAL/ssubSUB_TS_GOHEAD_GENERAL:SAPLMIGO:0110/txtGOHEAD-BKTXT"
+' ==============================================================================
+' BUTTON MACROS
+' ==============================================================================
+Sub Btn_Run_CZK():  Call Process_MIGO_Main("CZK"):  End Sub
+Sub Btn_Run_CZVK(): Call Process_MIGO_Main("CZVK"): End Sub
 
-' Detail View IDs
-Private Const ID_TAB_DEST         As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/tabsTS_GOITEM/tabpOK_GOITEM_DESTINAT."
-Private Const ID_DETAIL_TXT       As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/tabsTS_GOITEM/tabpOK_GOITEM_DESTINAT./ssubSUB_TS_GOITEM_DESTINATION:SAPLMIGO:0325/txtGOITEM-SGTXT"
-Private Const ID_DETAIL_OK        As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/subSUB_DETAIL_TAKE:SAPLMIGO:0304/chkGODYNPRO-DETAIL_TAKE"
-
-Public Sub Process_MIGO_Restart_Every_Time()
-    Dim ses As Object
-    Set ses = modSAP.SapGetSessionByTCode("P10", "", "MIGO", True, False, True)
-    If ses Is Nothing Then MsgBox "Could not access SAP MIGO session.", vbCritical: Exit Sub
-
+' ==============================================================================
+' MAIN PROCESS
+' ==============================================================================
+Private Sub Process_MIGO_Main(ByVal activeFilter As String)
     Dim ws As Worksheet
     On Error Resume Next
     Set ws = ThisWorkbook.Worksheets(XL_SHEET_QUEUE)
     On Error GoTo 0
-    If ws Is Nothing Then MsgBox "Sheet '" & XL_SHEET_QUEUE & "' not found.", vbCritical: Exit Sub
+    If ws Is Nothing Then Exit Sub
 
-    Dim r As Long, lastRow As Long
-    Dim poNum As String, poItem As String
-    Dim grDocNum As String
-    Dim statusVal As String, filterVal As String
+    Dim startRow As Long, endRow As Long, lastRow As Long
+    Dim targetSystem As String
     
-    If XL_STOP_ROW_LIMIT > 0 Then lastRow = XL_STOP_ROW_LIMIT Else lastRow = ws.Cells(ws.Rows.Count, XL_COL_PO).End(xlUp).row
+    startRow = val(ws.Range(CELL_START_ROW).value): If startRow < 2 Then startRow = 2
+    endRow = val(ws.Range(CELL_END_ROW).value)
     
-    ' --- LOOP EXCEL ---
-    For r = XL_START_ROW To lastRow
+    activeFilter = UCase(Trim(activeFilter))
+    If activeFilter = "CZK" Then targetSystem = "P10" Else If activeFilter = "CZVK" Then targetSystem = "P32" Else Exit Sub
+    
+    If endRow > 0 Then lastRow = endRow Else lastRow = ws.Cells(ws.Rows.Count, XL_COL_PO).End(xlUp).row
+
+    ' CONNECT TO SAP
+    Dim ses As Object
+    Set ses = ModSAP.SapGetSessionByTCode(targetSystem, "", "MIGO", True, False, True)
+    If ses Is Nothing Then Exit Sub
+
+    Dim r As Long, poNum As String, poItem As String, rowFilter As String, grDocNum As String
+    
+    For r = startRow To lastRow
+        rowFilter = Trim(UCase(ws.Range(XL_COL_FILTER_SRC & r).value))
+        If rowFilter <> activeFilter Or Trim(UCase(ws.Range(XL_COL_STATUS & r).value)) = "GR" Then GoTo NextRow
         
-        ' 1. CHECK FILTER (Column B)
-        '    If a filter keyword is set, we skip rows that don't match.
-        If XL_FILTER_KW <> "" Then
-            filterVal = Trim(CStr(ws.Range(XL_COL_FILTER & r).value))
-            If UCase(filterVal) <> UCase(XL_FILTER_KW) Then
-                ' Filter mismatch -> Skip
-                GoTo NextRow
-            End If
-        End If
-        
-        ' 2. CHECK STATUS (Column A)
-        '    If already done ("GR"), skip.
-        statusVal = Trim(CStr(ws.Range(XL_COL_STATUS & r).value))
-        If UCase(statusVal) = "GR" Then
-            GoTo NextRow
-        End If
-        
-        ' 3. READ PO DATA
         poNum = Application.Clean(Trim(CStr(ws.Range(XL_COL_PO & r).value)))
         poItem = Application.Clean(Trim(CStr(ws.Range(XL_COL_ITEM & r).value)))
         
         If poNum <> "" Then
-            Application.StatusBar = "Processing Row " & r & " (PO: " & poNum & ")..."
+            Application.StatusBar = "Processing Row " & r & " [" & targetSystem & "]..."
             
-            ' A. RESTART MIGO
+            ' RESTART MIGO
             ses.findById("wnd[0]/tbar[0]/okcd").Text = "/nMIGO"
             ses.findById("wnd[0]").sendVKey 0
             
-            ' B. WAIT FOR RESET
-            If Not modSAP.SapWaitForId(ses, ID_PO_FIELD, 10) Then
-                MsgBox "Timeout waiting for MIGO to reset at Row " & r, vbCritical
-                Exit Sub
-            End If
-            
-            ' C. PROCESS & POST
-            grDocNum = Process_And_Post_PO(ses, poNum, poItem)
-            
-            ' D. WRITE RESULTS
-            If IsNumeric(grDocNum) And Len(grDocNum) > 5 Then
-                ' Success
-                ws.Range(XL_COL_STATUS & r).value = "GR"
-                ws.Range(XL_COL_DATE & r).value = Date
-                ws.Range(XL_COL_DOC & r).value = grDocNum
+            ' 시스템별 분기 호출
+            If targetSystem = "P32" Then
+                grDocNum = Process_And_Post_P32(ses, poNum, poItem)
             Else
-                ' Error
-                ws.Range(XL_COL_STATUS & r).value = "ERROR"
-                ws.Range(XL_COL_DOC & r).value = grDocNum
+                grDocNum = Process_And_Post_P10(ses, poNum, poItem)
             End If
             
+            ' WRITE RESULTS
+            ws.Range(XL_COL_STATUS & r).value = IIf(IsNumeric(grDocNum) And Len(grDocNum) > 5, "GR", "ERROR")
+            ws.Range(XL_COL_DOC & r).value = grDocNum
+            If ws.Range(XL_COL_STATUS & r).value = "GR" Then ws.Range(XL_COL_DATE & r).value = Date
         End If
 NextRow:
     Next r
-    
-    Application.StatusBar = ""
-    MsgBox "Queue processing complete.", vbInformation
+    Application.StatusBar = "": MsgBox "Done", vbInformation
 End Sub
 
-Private Function Process_And_Post_PO(ses As Object, poNum As String, poItem As String) As String
+' ==============================================================================
+' SYSTEM SPECIFIC LOGICS
+' ==============================================================================
+
+' --- P10 전용 로직 ---
+Private Function Process_And_Post_P10(ses As Object, poNum As String, poItem As String) As String
     On Error Resume Next
-    
-    ' --- STEP 1: ENTER HEADER ---
     ses.findById(ID_PO_FIELD).Text = poNum
-    If Len(poItem) > 0 Then
-        ses.findById(ID_ITEM_FIELD).Text = poItem
-    Else
-        ses.findById(ID_ITEM_FIELD).Text = ""
-    End If
-    
+    ses.findById(ID_ITEM_FIELD).Text = IIf(Len(poItem) > 0, poItem, "")
     ses.findById("wnd[0]").sendVKey 0
     SleepMs 1000
     ses.findById(ID_HEADER_TXT).Text = poNum
     
-    ' --- STEP 2: FIND GRID ---
-    If Not modSAP.SapWaitForId(ses, ID_TBL_MIGO, 5) Then
-        Process_And_Post_PO = "Error: Grid not found (Check PO)"
-        Exit Function
-    End If
+    Dim tblObj As Object: Set tblObj = ses.findById(ID_TBL_MIGO)
+    Dim k As Long, localRow As Long, rawText As String
     
-    Dim tblObj As Object
-    Set tblObj = ses.findById(ID_TBL_MIGO)
-
-    Dim pageRows As Long: pageRows = 6
-    Dim k As Long, localRow As Long
-    Dim maxItems As Long: maxItems = 150
-    Dim lineText As String, rawText As String
-    Dim btnRow As Object
-    
-    ' --- STEP 3: LOOP GRID ---
-    For k = 0 To maxItems
-        localRow = k Mod pageRows
-        
-        ' Paging
+    For k = 0 To 150
+        localRow = k Mod 6
         If (k > 0) And (localRow = 0) Then
-            tblObj.VerticalScrollbar.Position = k
-            ses.findById("wnd[0]").sendVKey 0
-            SleepMs 600
-            Set tblObj = ses.findById(ID_TBL_MIGO)
+            tblObj.VerticalScrollbar.Position = k: ses.findById("wnd[0]").sendVKey 0: SleepMs 600: Set tblObj = ses.findById(ID_TBL_MIGO)
         End If
         
-        ' Stop Condition
         rawText = ses.findById(ID_TBL_MIGO & "/ctxtGOITEM-MAKTX[7," & localRow & "]").Text
         If IsSapEmpty(rawText) Then Exit For
         
-        ' --- STEP 4: ACTION ---
-        lineText = CleanSapText(rawText)
-        
-        ' A. Click Row Button
-        Set btnRow = Nothing
-        Set btnRow = ses.findById(ID_TBL_MIGO & "/btnGOITEM-ZEILE[0," & localRow & "]")
-        If btnRow Is Nothing Then Exit For
-        
-        btnRow.SetFocus
-        btnRow.press
-        SleepMs 700
-        
-        ' B. Click Dest Tab
-        ses.findById(ID_TAB_DEST).Select
-        SleepMs 500
-        
-        ' C. Paste Text
-        Call modSAP.SapSafeSetText(ses, ID_DETAIL_TXT, lineText, 2)
-        
-        ' D. Item OK
-        ses.findById(ID_DETAIL_OK).Selected = True
-        SleepMs 200
-        
+        ses.findById(ID_TBL_MIGO & "/btnGOITEM-ZEILE[0," & localRow & "]").Press: SleepMs 700
+        ses.findById(ID_TAB_DEST).Select: SleepMs 500
+        Call ModSAP.SapSafeSetText(ses, ID_DETAIL_TXT, CleanSapText(rawText), 2)
+        ses.findById(ID_DETAIL_OK).Selected = True: SleepMs 200
     Next k
     
-    ' --- STEP 5: POST ---
-    ses.findById("wnd[0]/tbar[0]/btn[11]").press
-    SleepMs 1000
-    
-    ' --- STEP 6: GET RESULT ---
-    modSAP.SapTryDismissPopup ses
-    
-    Dim msgText As String, msgType As String
-    msgText = ses.findById("wnd[0]/sbar").Text
-    msgType = ses.findById("wnd[0]/sbar").MessageType
-    
-    If msgType = "S" Then
-        Process_And_Post_PO = ExtractDocNum(msgText)
-    Else
-        Process_And_Post_PO = "Error: " & msgText
-    End If
-    
-    On Error GoTo 0
+    ses.findById("wnd[0]/tbar[0]/btn[11]").Press: SleepMs 1000
+    ModSAP.SapTryDismissPopup ses
+    Process_And_Post_P10 = GetFinalStatus(ses)
 End Function
 
-' --- Helpers ---
+' --- P32 전용 (Item OK 체크 성공 지점으로 복원 및 안정화) ---
+Private Function Process_And_Post_P32(ses As Object, poNum As String, poItem As String) As String
+    On Error Resume Next
+    
+    ' 1. PO 호출 및 초기 대기
+    ses.findById(ID_PO_FIELD).Text = poNum
+    ses.findById(ID_ITEM_FIELD).Text = IIf(Len(poItem) > 0, poItem, "")
+    ses.findById("wnd[0]").sendVKey 0
+    SleepMs 1500 ' P32의 로딩 속도를 고려하여 충분히 대기
+    
+    ses.findById(ID_HEADER_TXT).Text = poNum
+    
+    Dim tblObj As Object: Set tblObj = ses.findById(ID_TBL_MIGO)
+    Dim k As Long, localRow As Long, rawText As String, lineText As String
+    Dim btnRow As Object
+
+    ' 2. 그리드 루프 시작
+    For k = 0 To 150
+        localRow = k Mod 6
+        
+        ' 스크롤 처리
+        If (k > 0) And (localRow = 0) Then
+            tblObj.VerticalScrollbar.Position = k
+            ses.findById("wnd[0]").sendVKey 0
+            SleepMs 800
+            Set tblObj = ses.findById(ID_TBL_MIGO)
+        End If
+
+        ' 품목 텍스트 가져오기 (P32 레퍼런스인 1번 컬럼 사용)
+        rawText = ses.findById(ID_TBL_MIGO & "/ctxtGOITEM-MAKTX[1," & localRow & "]").Text
+        If IsSapEmpty(rawText) Then Exit For
+        lineText = CleanSapText(rawText)
+
+        ' 3. [핵심] 행 클릭 - 이 동작이 상세 창의 컨트롤을 깨웁니다.
+        Set btnRow = ses.findById(ID_TBL_MIGO & "/btnGOITEM-ZEILE[0," & localRow & "]")
+        btnRow.SetFocus
+        btnRow.Press
+        SleepMs 1000 ' 상세 창이 완전히 열릴 때까지 대기
+
+        ' 4. Destination 탭 선택 (필수)
+        With ses.findById(ID_TAB_DEST)
+            .SetFocus
+            .Select
+        End With
+        SleepMs 600
+
+        ' 5. 텍스트 입력
+        With ses.findById(ID_DETAIL_TXT)
+            .SetFocus
+            .Text = lineText
+        End With
+        
+        ' 6. Item OK 체크 (가장 확실했던 .Selected = True 사용)
+        With ses.findById(ID_DETAIL_OK)
+            .SetFocus
+            .Selected = True
+        End With
+        
+        ' 7. 확정 엔터 - 체크박스 상태를 시스템에 반영
+        ses.findById("wnd[0]").sendVKey 0
+        SleepMs 500
+        
+    Next k
+
+    ' 8. POST
+    ses.findById("wnd[0]/tbar[0]/btn[11]").Press
+    SleepMs 2000
+    ModSAP.SapTryDismissPopup ses
+    Process_And_Post_P32 = GetFinalStatus(ses)
+End Function
+
+' ==============================================================================
+' COMMON HELPERS
+' ==============================================================================
+Private Function GetFinalStatus(ses As Object) As String
+    On Error Resume Next
+    Dim m As String: m = ses.findById("wnd[0]/sbar").Text
+    Dim t As String: t = ses.findById("wnd[0]/sbar").MessageType
+    If t = "S" Then GetFinalStatus = ExtractDocNum(m) Else GetFinalStatus = "Error: " & m
+End Function
 
 Private Function ExtractDocNum(txt As String) As String
     Dim i As Long, res As String, ch As String
     For i = 1 To Len(txt)
-        ch = Mid(txt, i, 1)
-        If IsNumeric(ch) Then
-            res = res & ch
-        ElseIf Len(res) >= 9 Then
-            Exit For
-        Else
-            res = ""
-        End If
+        ch = Mid(txt, i, 1): If IsNumeric(ch) Then res = res & ch Else If Len(res) >= 9 Then Exit For Else res = ""
     Next i
-    If Len(res) > 0 Then ExtractDocNum = res Else ExtractDocNum = txt
+    ExtractDocNum = IIf(Len(res) > 0, res, txt)
 End Function
 
-Private Function IsSapEmpty(val As String) As Boolean
-    IsSapEmpty = (Len(Trim(Replace(val, "_", ""))) = 0)
-End Function
-
-Private Function CleanSapText(val As String) As String
-    CleanSapText = Trim(Replace(val, "_", ""))
-End Function
-
-Private Sub SleepMs(ByVal ms As Long)
-    Dim t As Double: t = Timer
-    Do While (Timer - t) * 1000 < ms
-        DoEvents
-    Loop
-End Sub
+Private Function IsSapEmpty(v As String) As Boolean: IsSapEmpty = (Len(Trim(Replace(v, "_", ""))) = 0): End Function
+Private Function CleanSapText(v As String) As String: CleanSapText = Trim(Replace(v, "_", "")): End Function
+Private Sub SleepMs(ByVal ms As Long): Dim t As Double: t = Timer: Do While (Timer - t) * 1000 < ms: DoEvents: Loop: End Sub
