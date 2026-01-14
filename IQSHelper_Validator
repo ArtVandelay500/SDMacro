@@ -1,0 +1,93 @@
+Sub IQS_Validate()
+    Dim ws As Worksheet
+    Dim lastRow As Long, i As Long, j As Long
+    
+    ' 1. SETUP
+    ' ---------------------------------------------------------
+    Set ws = Sheets("Helper")
+    
+    On Error Resume Next
+    ws.Unprotect
+    On Error GoTo 0
+    
+    ' ==========================================================================
+    ' [추가] 서식 충돌 방지: F:J열의 모든 조건부 서식과 글자색을 초기화합니다.
+    ' ==========================================================================
+    With ws.Range("F3:J" & ws.Rows.Count)
+        .FormatConditions.Delete      ' 기존 모든 조건부 서식 삭제
+        .Font.ColorIndex = xlAutomatic ' 글자색 검정으로 초기화
+        ' .Interior.ColorIndex = xlNone  ' (선택사항) 배경색도 지우고 싶다면 주석 해제
+    End With
+
+    ' ==========================================================================
+    ' 2. CONSOLIDATE PDF DATA (Columns A:C)
+    ' ==========================================================================
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    If lastRow >= 3 Then
+        ws.Range("A3:C" & lastRow).Sort Key1:=ws.Range("A3"), Order1:=xlAscending, Header:=xlNo
+        
+        For i = lastRow To 4 Step -1
+            If ws.Cells(i, 1).Value = ws.Cells(i - 1, 1).Value And ws.Cells(i, 1).Value <> "" Then
+                ws.Cells(i - 1, 2).Value = ws.Cells(i - 1, 2).Value + ws.Cells(i, 2).Value
+                ws.Cells(i - 1, 3).Value = ws.Cells(i - 1, 3).Value + ws.Cells(i, 3).Value
+                ' 옆 열(F:H)에 영향을 주지 않기 위해 전체 행 삭제 대신 범위 삭제 사용
+                ws.Range("A" & i & ":C" & i).Delete Shift:=xlUp
+            End If
+        Next i
+    End If
+
+    ' ==========================================================================
+    ' 3. CONSOLIDATE USER DATA (Columns F:H)
+    ' ==========================================================================
+    lastRow = ws.Cells(ws.Rows.Count, "F").End(xlUp).Row
+    If lastRow >= 3 Then
+        For i = lastRow To 4 Step -1
+            For j = 3 To i - 1
+                If ws.Cells(i, 6).Value = ws.Cells(j, 6).Value And ws.Cells(i, 6).Value <> "" Then
+                    ws.Cells(j, 7).Value = ws.Cells(j, 7).Value + ws.Cells(i, 7).Value
+                    ws.Cells(j, 8).Value = ws.Cells(j, 8).Value + ws.Cells(i, 8).Value
+                    ws.Range("F" & i & ":H" & i).Delete Shift:=xlUp
+                    Exit For
+                End If
+            Next j
+        Next i
+    End If
+    
+    ' ==========================================================================
+    ' 4. VALIDATION (I:J 수식 및 하이라이트)
+    ' ==========================================================================
+    Dim lastRowA As Long, lastRowF As Long
+    lastRowA = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    lastRowF = ws.Cells(ws.Rows.Count, "F").End(xlUp).Row
+    If lastRowF < 3 Then lastRowF = 3
+    
+    ' 수식 입력
+    ws.Range("I3:I" & lastRowF).Formula = "=SUMIF($A$3:$A$" & lastRowA & ", F3, $C$3:$C$" & lastRowA & ")"
+    ws.Range("J3:J" & lastRowF).Formula = "=SUMIF($A$3:$A$" & lastRowA & ", F3, $B$3:$B$" & lastRowA & ")"
+    ws.Range("I3:J" & lastRowF).NumberFormat = "#,##0"
+
+    ' --- 조건부 서식 다시 적용 (비교 대상인 H열과 I열 모두에 색상 적용) ---
+    
+    ' 금액 비교 (H열과 I열)
+    Dim formulaPrice As String
+    formulaPrice = "=AND($F3<>"""", ROUND($H3,0)<>ROUND($I3,0))"
+    
+    With ws.Range("H3:I" & lastRowF).FormatConditions.Add(Type:=xlExpression, Formula1:=formulaPrice)
+        .Interior.Color = RGB(255, 255, 0) ' 배경 노랑
+        .Font.Color = vbRed               ' 글자 빨강 (확실히 보이게 지정)
+    End With
+    
+    ' 수량 비교 (G열과 J열)
+    Dim formulaQty As String
+    formulaQty = "=AND($F3<>"""", $G3<>$J3)"
+    
+    With ws.Range("G3:G" & lastRowF & ", J3:J" & lastRowF).FormatConditions.Add(Type:=xlExpression, Formula1:=formulaQty)
+        .Interior.Color = RGB(255, 255, 0)
+        .Font.Color = vbRed
+    End With
+
+    ' 보호 설정
+    ws.Protect Password:="", UserInterfaceOnly:=True, AllowFormattingCells:=True, AllowInsertingRows:=True, AllowDeletingRows:=True
+
+    MsgBox "Process Complete", vbInformation
+End Sub
