@@ -1,0 +1,99 @@
+Sub Strict_Values_Only_Extractor()
+    Dim wsSource As Worksheet, wsDest As Worksheet
+    Dim lastRow As Long, r As Long, outRow As Long
+    Dim regEx As Object
+    Dim cellVal As String
+    
+    ' Variables to hold the values
+    Dim vID As Variant
+    Dim vQty As Variant
+    Dim vUnit As Variant
+    Dim vUnitPrice As Variant
+    Dim vTotalPrice As Variant
+    
+    ' 임시 변수 (데이터 정제용)
+    Dim cleanQty As String, cleanUnitPrice As String, cleanTotalPrice As String
+    
+    ' ---------------------------------------------------------
+    ' 1. VALIDATION: Check if Active Sheet is 'Input'
+    ' ---------------------------------------------------------
+    If ActiveSheet.Name <> "Input" Then
+        MsgBox "Please run this macro only while on the 'Input' sheet.", vbExclamation
+        Exit Sub
+    End If
+    
+    Set wsSource = ActiveSheet
+    lastRow = wsSource.Cells(wsSource.Rows.Count, 1).End(xlUp).Row
+    
+    ' ---------------------------------------------------------
+    ' 2. DESTINATION: Set to 'Helper' sheet
+    ' ---------------------------------------------------------
+    On Error Resume Next
+    Set wsDest = Sheets("Helper")
+    On Error GoTo 0
+    
+    If wsDest Is Nothing Then
+        MsgBox "The sheet 'Helper' was not found!", vbCritical
+        Exit Sub
+    End If
+    
+    ' ---------------------------------------------------------
+    ' 3. CLEAR OLD DATA (Strictly A3:C downwards)
+    ' ---------------------------------------------------------
+    wsDest.Range("A3:C" & wsDest.Rows.Count).ClearContents
+    
+    ' Initialize Output Row (Start at A3)
+    outRow = 3
+    
+    ' 4. Regex Pattern for ID: XXXXXX-XXXX-XXX
+    Set regEx = CreateObject("VBScript.RegExp")
+    regEx.Global = False
+    regEx.IgnoreCase = True
+    regEx.Pattern = "\d{6}-\d{4}-\d{3}"
+    
+    ' 5. Loop through Source Data
+    For r = 1 To lastRow
+        cellVal = Trim(CStr(wsSource.Cells(r, 1).Value))
+        
+        ' CHECK 1: Match ID Pattern
+        If regEx.Test(cellVal) Then
+            
+            ' 값 캡처
+            vID = cellVal
+            vQty = wsSource.Cells(r + 1, 1).Value
+            vUnit = wsSource.Cells(r + 2, 1).Value
+            vUnitPrice = wsSource.Cells(r + 3, 1).Value
+            vTotalPrice = wsSource.Cells(r + 4, 1).Value
+            
+            ' 데이터 정제: 콤마(,)와 줄바꿈(Chr 10/13) 제거
+            cleanQty = Replace(Replace(Replace(CStr(vQty), ",", ""), Chr(10), ""), Chr(13), "")
+            cleanUnitPrice = Replace(Replace(Replace(CStr(vUnitPrice), ",", ""), Chr(10), ""), Chr(13), "")
+            cleanTotalPrice = Replace(Replace(Replace(CStr(vTotalPrice), ",", ""), Chr(10), ""), Chr(13), "")
+            
+            ' CHECK 2: 정제된 데이터로 시퀀스 검증
+            ' Qty와 UnitPrice가 숫자이고, Unit은 숫자가 아닌 경우만 진행
+            If IsNumeric(cleanQty) And Not IsNumeric(Trim(CStr(vUnit))) And IsNumeric(cleanUnitPrice) Then
+                
+                ' 추출 결과 입력
+                wsDest.Cells(outRow, 1).Value = vID
+                wsDest.Cells(outRow, 2).Value = Val(cleanQty) ' 숫자 형식으로 입력
+                
+                ' Total Price 처리
+                If IsNumeric(cleanTotalPrice) Then
+                    wsDest.Cells(outRow, 3).Value = CDbl(cleanTotalPrice) ' 숫자 형식으로 입력
+                Else
+                    wsDest.Cells(outRow, 3).Value = ""
+                End If
+                
+                outRow = outRow + 1
+            End If
+        End If
+    Next r
+    
+    ' 6. Apply Decimal Formatting to Total Price (Column C only)
+    If outRow > 3 Then
+        wsDest.Range("C3:C" & outRow - 1).NumberFormat = "#,##0"
+    End If
+    
+    MsgBox "추출 완료! 'Helper' 시트 A3부터 데이터를 확인하세요.", vbInformation
+End Sub
