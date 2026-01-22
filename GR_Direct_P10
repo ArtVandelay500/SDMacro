@@ -15,6 +15,7 @@ Private Const XL_COL_PO            As String = "D"
 Private Const XL_COL_ITEM          As String = "E"
 Private Const XL_COL_DATE          As String = "J"
 Private Const XL_COL_DOC           As String = "K"
+Private Const XL_COL_INPUT_DATE    As String = "M"
 
 ' ==============================================================================
 ' SAP CONFIGURATION
@@ -23,16 +24,18 @@ Private Const ID_TBL_MIGO          As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:
 Private Const ID_PO_FIELD          As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_FIRSTLINE:SAPLMIGO:0010/subSUB_FIRSTLINE_REFDOC:SAPLMIGO:2000/ctxtGODYNPRO-PO_NUMBER"
 Private Const ID_ITEM_FIELD        As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_FIRSTLINE:SAPLMIGO:0010/subSUB_FIRSTLINE_REFDOC:SAPLMIGO:2000/txtGODYNPRO-PO_ITEM"
 Private Const ID_HEADER_TXT        As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_HEADER:SAPLMIGO:0101/subSUB_HEADER:SAPLMIGO:0100/tabsTS_GOHEAD/tabpOK_GOHEAD_GENERAL/ssubSUB_TS_GOHEAD_GENERAL:SAPLMIGO:0110/txtGOHEAD-BKTXT"
+Private Const ID_DOC_DATE          As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_HEADER:SAPLMIGO:0101/subSUB_HEADER:SAPLMIGO:0100/tabsTS_GOHEAD/tabpOK_GOHEAD_GENERAL/ssubSUB_TS_GOHEAD_GENERAL:SAPLMIGO:0110/ctxtGOHEAD-BLDAT"
 
 Private Const ID_TAB_DEST          As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/tabsTS_GOITEM/tabpOK_GOITEM_DESTINAT."
 Private Const ID_DETAIL_TXT        As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/tabsTS_GOITEM/tabpOK_GOITEM_DESTINAT./ssubSUB_TS_GOITEM_DESTINATION:SAPLMIGO:0325/txtGOITEM-SGTXT"
 Private Const ID_DETAIL_OK         As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/subSUB_DETAIL_TAKE:SAPLMIGO:0304/chkGODYNPRO-DETAIL_TAKE"
+Private Const ID_DETAIL_ZEILE      As String = "wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/txtGODYNPRO-DETAIL_ZEILE"
 
 ' ==============================================================================
 ' BUTTON MACROS
 ' ==============================================================================
-Sub Btn_Run_CZK():  Call Process_MIGO_Main("CZK"):  End Sub
-Sub Btn_Run_CZVK(): Call Process_MIGO_Main("CZVK"): End Sub
+Sub Btn_Run_CZK():   Call Process_MIGO_Main("CZK"):  End Sub
+Sub Btn_Run_CZVK():  Call Process_MIGO_Main("CZVK"): End Sub
 
 ' ==============================================================================
 ' MAIN PROCESS
@@ -47,15 +50,14 @@ Private Sub Process_MIGO_Main(ByVal activeFilter As String)
     Dim startRow As Long, endRow As Long, lastRow As Long
     Dim targetSystem As String
     
-    startRow = val(ws.Range(CELL_START_ROW).value): If startRow < 2 Then startRow = 2
-    endRow = val(ws.Range(CELL_END_ROW).value)
+    startRow = Val(ws.Range(CELL_START_ROW).value): If startRow < 2 Then startRow = 2
+    endRow = Val(ws.Range(CELL_END_ROW).value)
     
     activeFilter = UCase(Trim(activeFilter))
     If activeFilter = "CZK" Then targetSystem = "P10" Else If activeFilter = "CZVK" Then targetSystem = "P32" Else Exit Sub
     
     If endRow > 0 Then lastRow = endRow Else lastRow = ws.Cells(ws.Rows.Count, XL_COL_PO).End(xlUp).row
 
-    ' CONNECT TO SAP
     Dim ses As Object
     Set ses = ModSAP.SapGetSessionByTCode(targetSystem, "", "MIGO", True, False, True)
     If ses Is Nothing Then Exit Sub
@@ -71,19 +73,15 @@ Private Sub Process_MIGO_Main(ByVal activeFilter As String)
         
         If poNum <> "" Then
             Application.StatusBar = "Processing Row " & r & " [" & targetSystem & "]..."
-            
-            ' RESTART MIGO
             ses.findById("wnd[0]/tbar[0]/okcd").Text = "/nMIGO"
             ses.findById("wnd[0]").sendVKey 0
             
-            ' 시스템별 분기 호출
             If targetSystem = "P32" Then
-                grDocNum = Process_And_Post_P32(ses, poNum, poItem)
+                grDocNum = Process_And_Post_P32(ses, poNum, poItem, r, ws)
             Else
-                grDocNum = Process_And_Post_P10(ses, poNum, poItem)
+                grDocNum = Process_And_Post_P10(ses, poNum, poItem, r, ws)
             End If
             
-            ' WRITE RESULTS
             ws.Range(XL_COL_STATUS & r).value = IIf(IsNumeric(grDocNum) And Len(grDocNum) > 5, "GR", "ERROR")
             ws.Range(XL_COL_DOC & r).value = grDocNum
             If ws.Range(XL_COL_STATUS & r).value = "GR" Then ws.Range(XL_COL_DATE & r).value = Date
@@ -93,116 +91,81 @@ NextRow:
     Application.StatusBar = "": MsgBox "Done", vbInformation
 End Sub
 
-' ==============================================================================
-' SYSTEM SPECIFIC LOGICS
-' ==============================================================================
+' ############################################################
+' SYSTEM LOGICS
+' ############################################################
 
-' --- P10 전용 로직 ---
-Private Function Process_And_Post_P10(ses As Object, poNum As String, poItem As String) As String
+' --- P10 LOGIC (Stable Detail-to-Detail Extraction) ---
+Private Function Process_And_Post_P10(ses As Object, poNum As String, poItem As String, r As Long, ws As Worksheet) As String
     On Error Resume Next
+    
+    ' 1. INITIAL PO CALL
     ses.findById(ID_PO_FIELD).Text = poNum
     ses.findById(ID_ITEM_FIELD).Text = IIf(Len(poItem) > 0, poItem, "")
     ses.findById("wnd[0]").sendVKey 0
+    SleepMs 1500
+    
+    ' 2. DATE HANDLING (Strict yyyy.mm.dd from Column M)
+    Dim sapDate As String: sapDate = Trim(ws.Cells(r, XL_COL_INPUT_DATE).value)
+    If sapDate = "" Then sapDate = Format(Date, "yyyy.mm.dd")
+    If IsDate(sapDate) Then sapDate = Format(CDate(sapDate), "yyyy.mm.dd")
+    
+    ses.findById(ID_DOC_DATE).Text = sapDate
+    ses.findById(ID_HEADER_TXT).Text = poNum
+    
+    ' 3. OPEN FIRST ITEM
+    ses.findById("wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMLIST:SAPLMIGO:0200/tblSAPLMIGOTV_GOITEM/btnGOITEM-ZEILE[0,0]").Press
     SleepMs 1000
-    ses.findById(ID_HEADER_TXT).Text = poNum
+
+    Dim k As Long
+    Dim currentRowNum As String, previousRowNum As String
+    Dim lineDescription As String
     
-    Dim tblObj As Object: Set tblObj = ses.findById(ID_TBL_MIGO)
-    Dim k As Long, localRow As Long, rawText As String
-    
-    For k = 0 To 150
-        localRow = k Mod 6
-        If (k > 0) And (localRow = 0) Then
-            tblObj.VerticalScrollbar.Position = k: ses.findById("wnd[0]").sendVKey 0: SleepMs 600: Set tblObj = ses.findById(ID_TBL_MIGO)
-        End If
+    ' 4. SEQUENTIAL NAVIGATION LOOP
+    For k = 1 To 150
+        ' A. Get the CURRENT Row Number (Anchor)
+        currentRowNum = Trim(ses.findById("wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/txtGODYNPRO-DETAIL_ZEILE").Text)
         
-        rawText = ses.findById(ID_TBL_MIGO & "/ctxtGOITEM-MAKTX[7," & localRow & "]").Text
-        If IsSapEmpty(rawText) Then Exit For
+        ' --- BOTTOM CHECK ---
+        If currentRowNum = "" Or (k > 1 And currentRowNum = previousRowNum) Then Exit For
         
-        ses.findById(ID_TBL_MIGO & "/btnGOITEM-ZEILE[0," & localRow & "]").Press: SleepMs 700
-        ses.findById(ID_TAB_DEST).Select: SleepMs 500
-        Call ModSAP.SapSafeSetText(ses, ID_DETAIL_TXT, CleanSapText(rawText), 2)
-        ses.findById(ID_DETAIL_OK).Selected = True: SleepMs 200
-    Next k
-    
-    ses.findById("wnd[0]/tbar[0]/btn[11]").Press: SleepMs 1000
-    ModSAP.SapTryDismissPopup ses
-    Process_And_Post_P10 = GetFinalStatus(ses)
-End Function
-
-' --- P32 전용 (Item OK 체크 성공 지점으로 복원 및 안정화) ---
-Private Function Process_And_Post_P32(ses As Object, poNum As String, poItem As String) As String
-    On Error Resume Next
-    
-    ' 1. PO 호출 및 초기 대기
-    ses.findById(ID_PO_FIELD).Text = poNum
-    ses.findById(ID_ITEM_FIELD).Text = IIf(Len(poItem) > 0, poItem, "")
-    ses.findById("wnd[0]").sendVKey 0
-    SleepMs 1500 ' P32의 로딩 속도를 고려하여 충분히 대기
-    
-    ses.findById(ID_HEADER_TXT).Text = poNum
-    
-    Dim tblObj As Object: Set tblObj = ses.findById(ID_TBL_MIGO)
-    Dim k As Long, localRow As Long, rawText As String, lineText As String
-    Dim btnRow As Object
-
-    ' 2. 그리드 루프 시작
-    For k = 0 To 150
-        localRow = k Mod 6
+        ' B. EXTRACT TEXT FROM MATERIAL TAB (Stable ID)
+        ses.findById("wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/tabsTS_GOITEM/tabpOK_GOITEM_MATERIAL").Select
+        lineDescription = ses.findById("wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/tabsTS_GOITEM/tabpOK_GOITEM_MATERIAL/ssubSUB_TS_GOITEM_MATERIAL:SAPLMIGO:0310/ctxtGOITEM-MAKTX").Text
         
-        ' 스크롤 처리
-        If (k > 0) And (localRow = 0) Then
-            tblObj.VerticalScrollbar.Position = k
-            ses.findById("wnd[0]").sendVKey 0
-            SleepMs 800
-            Set tblObj = ses.findById(ID_TBL_MIGO)
-        End If
-
-        ' 품목 텍스트 가져오기 (P32 레퍼런스인 1번 컬럼 사용)
-        rawText = ses.findById(ID_TBL_MIGO & "/ctxtGOITEM-MAKTX[1," & localRow & "]").Text
-        If IsSapEmpty(rawText) Then Exit For
-        lineText = CleanSapText(rawText)
-
-        ' 3. [핵심] 행 클릭 - 이 동작이 상세 창의 컨트롤을 깨웁니다.
-        Set btnRow = ses.findById(ID_TBL_MIGO & "/btnGOITEM-ZEILE[0," & localRow & "]")
-        btnRow.SetFocus
-        btnRow.Press
-        SleepMs 1000 ' 상세 창이 완전히 열릴 때까지 대기
-
-        ' 4. Destination 탭 선택 (필수)
-        With ses.findById(ID_TAB_DEST)
-            .SetFocus
-            .Select
-        End With
-        SleepMs 600
-
-        ' 5. 텍스트 입력
-        With ses.findById(ID_DETAIL_TXT)
-            .SetFocus
-            .Text = lineText
-        End With
+        ' C. PASTE TEXT INTO DESTINATION TAB
+        ses.findById(ID_TAB_DEST).Select
+        SleepMs 300
+        ses.findById(ID_DETAIL_TXT).Text = CleanSapText(lineDescription)
         
-        ' 6. Item OK 체크 (가장 확실했던 .Selected = True 사용)
+        ' D. ITEM OK CHECK
         With ses.findById(ID_DETAIL_OK)
             .SetFocus
             .Selected = True
         End With
         
-        ' 7. 확정 엔터 - 체크박스 상태를 시스템에 반영
-        ses.findById("wnd[0]").sendVKey 0
-        SleepMs 500
+        ' Store current row number before moving
+        previousRowNum = currentRowNum
         
+        ' E. PRESS NEXT ITEM
+        ses.findById("wnd[0]/usr/ssubSUB_MAIN_CARRIER:SAPLMIGO:0003/subSUB_ITEMDETAIL:SAPLMIGO:0301/subSUB_DETAIL:SAPLMIGO:0300/btnOK_NEXT_ITEM").Press
+        
+        ' F. REFRESH & WAIT
+        SleepMs 800
+        
+        ' Dismiss warning popups
+        If ses.Children.Count > 1 Then ses.findById("wnd[1]").sendVKey 0
     Next k
-
-    ' 8. POST
-    ses.findById("wnd[0]/tbar[0]/btn[11]").Press
-    SleepMs 2000
+    
+    ' 5. POST
+    ses.findById("wnd[0]/tbar[0]/btn[11]").Press: SleepMs 2000
     ModSAP.SapTryDismissPopup ses
-    Process_And_Post_P32 = GetFinalStatus(ses)
+    Process_And_Post_P10 = GetFinalStatus(ses)
 End Function
 
-' ==============================================================================
-' COMMON HELPERS
-' ==============================================================================
+' ############################################################
+' HELPERS
+' ############################################################
 Private Function GetFinalStatus(ses As Object) As String
     On Error Resume Next
     Dim m As String: m = ses.findById("wnd[0]/sbar").Text
