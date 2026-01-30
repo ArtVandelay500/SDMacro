@@ -1,0 +1,227 @@
+Option Explicit
+
+' ==========================================
+' GLOBAL CONFIGURATION (CENTRAL CONTROL)
+' ==========================================
+Public Const DATA_START_ROW As Long = 15      ' First row of user data entry
+Public Const HEADER_ROW As Long = 14          ' Row where variable table headers sit
+
+' --- Cell Addresses for Document Header (Column C) ---
+Private Const ADDR_TYPE As String = "C2"          ' CZK or CZVK
+Private Const ADDR_HDR_TEXT As String = "C3"      ' Header Text
+Private Const ADDR_VND_CODE As String = "C4"      ' Vendor Code
+Private Const ADDR_VND_NAME As String = "C5"      ' Vendor Name (Optional)
+Private Const ADDR_INV_DATE As String = "C6"      ' Invoice Date
+Private Const ADDR_TEXT As String = "C7"          ' Text (Used for Filename)
+Private Const ADDR_ASSIGN As String = "C8"        ' Assignment
+Private Const ADDR_CURR As String = "C9"          ' Currency
+Private Const ADDR_CONTROL_TOTAL As String = "C10" ' Control Total for Validation
+Private Const ADDR_SAVE_PATH As String = "C11"    ' Export Folder Path
+
+' ############################################################
+' MAIN PROCESS: VALIDATION, CALCULATION & EXPORT
+' ############################################################
+Sub CreateTemplate_CZK_hartrodt()
+    Dim wsIn As Worksheet: Set wsIn = ThisWorkbook.Sheets("InputForm")
+    Dim wsM As Worksheet: Set wsM = ThisWorkbook.Sheets("MaterialMaster")
+    Dim lastRow As Long, i As Long, targetRow As Long
+    Dim docType As String, rawInput As String, cleanDigits As String
+    Dim wbNew As Workbook, wsOut As Worksheet
+    Dim finalFileName As String, finalSavePath As String
+    Dim runningTotal As Double, controlTotal As Double
+    
+    '--- 1. MANDATORY HEADER VALIDATION & AGGRESSIVE TRIM ---
+    Dim mandatoryCells As Variant, cellAddr As Variant
+    mandatoryCells = Array(ADDR_TYPE, ADDR_HDR_TEXT, ADDR_VND_CODE, ADDR_INV_DATE, ADDR_TEXT, ADDR_ASSIGN, ADDR_CURR, ADDR_CONTROL_TOTAL)
+    
+    For Each cellAddr In mandatoryCells
+        ' Apply Aggressive Trim to Header Inputs
+        wsIn.Range(cellAddr).Value = SuperTrim(CStr(wsIn.Range(cellAddr).Value))
+        
+        If wsIn.Range(cellAddr).Value = "" Then
+            wsIn.Range(cellAddr).Interior.Color = vbYellow
+            MsgBox "MANDATORY FIELD MISSING: Please fill in " & cellAddr, vbCritical
+            Exit Sub
+        Else
+            wsIn.Range(cellAddr).Interior.ColorIndex = xlNone
+        End If
+    Next cellAddr
+
+    '--- 2. INITIAL SETUP & DECIMAL REVISION ---
+    docType = UCase(Trim(wsIn.Range(ADDR_TYPE).Value))
+    
+    ' Revise Control Total to whole number
+    controlTotal = Round(Val(wsIn.Range(ADDR_CONTROL_TOTAL).Value), 0)
+    wsIn.Range(ADDR_CONTROL_TOTAL).Value = controlTotal
+    
+    lastRow = wsIn.Cells(wsIn.Rows.Count, "K").End(xlUp).Row
+    
+    If lastRow < DATA_START_ROW Then
+        MsgBox "No line items found starting at row " & DATA_START_ROW & ".", vbExclamation
+        Exit Sub
+    End If
+
+    Application.ScreenUpdating = False
+    runningTotal = 0
+
+    '--- 3. LINE ITEM VALIDATION, SMART PARSING & ROUNDING ---
+    For i = DATA_START_ROW To lastRow
+        ' Aggressive Trim for PO/ID
+        rawInput = SuperTrim(UCase(CStr(wsIn.Cells(i, "K").Value)))
+        wsIn.Cells(i, "K").Value = rawInput ' Write back cleaned value
+        cleanDigits = Replace(rawInput, "-", "")
+        
+        Dim manualMat As String: manualMat = SuperTrim(CStr(wsIn.Cells(i, "N").Value))
+        Dim finalCat As String: finalCat = ""
+
+        ' A. 13-Digit Material Number Logic
+        If Len(cleanDigits) = 13 And IsNumeric(cleanDigits) Then
+            finalCat = "MAT"
+            wsIn.Cells(i, "N").Value = Left(cleanDigits, 6) & "-" & Mid(cleanDigits, 7, 4) & "-" & Right(cleanDigits, 3)
+            
+        ' B. PO Logic
+        ElseIf InStr(rawInput, "/") > 0 Or (IsNumeric(rawInput) And Len(rawInput) = 10) Then
+            finalCat = "PO"
+            
+        ' C. CZK/CZVK Mode Logic
+        ElseIf docType = "CZK" Then
+            If (Left(rawInput, 1) = "P" And Len(rawInput) = 5) Or (Len(rawInput) = 7 And HasDigit(rawInput)) Then
+                finalCat = "MAT"
+            End If
+        ElseIf docType = "CZVK" Then
+            If InStr(rawInput, "Z2SE") > 0 Then
+                finalCat = "Z2SE"
+            ElseIf (Left(rawInput, 1) = "P" And Len(rawInput) = 5) Or (Len(rawInput) = 7 And HasDigit(rawInput)) Then
+                finalCat = "GL"
+            End If
+        End If
+
+        If finalCat = "" Then
+            MsgBox "ERROR Row " & i & ": Invalid ID format.", vbCritical: GoTo CleanExit
+        End If
+
+        ' D. Material Master Lookup (7-digit CC)
+        If Len(rawInput) = 7 And manualMat = "" Then
+            Dim mResult As Variant
+            mResult = Application.XLookup(rawInput, wsM.Range("C:C"), wsM.Range("B:B"), "NOT FOUND")
+            If mResult = "NOT FOUND" And IsNumeric(rawInput) Then
+                mResult = Application.XLookup(CLng(rawInput), wsM.Range("C:C"), wsM.Range("B:B"), "NOT FOUND")
+            End If
+            If mResult = "NOT FOUND" Then
+                MsgBox "ERROR Row " & i & ": CC " & rawInput & " not in Master.", vbCritical: GoTo CleanExit
+            End If
+            wsIn.Cells(i, "N").Value = mResult
+        End If
+
+        ' E. DECIMAL REVISION: Round Line Items to Whole Numbers
+        Dim lVAT As Double: lVAT = Round(Val(wsIn.Cells(i, "H").Value), 0)
+        Dim lNET As Double: lNET = Round(Val(wsIn.Cells(i, "I").Value), 0)
+        Dim lTotal As Double: lTotal = lVAT + lNET
+        
+        ' Reflect rounded values on sheet
+        wsIn.Cells(i, "H").Value = lVAT
+        wsIn.Cells(i, "I").Value = lNET
+        wsIn.Cells(i, "J").Value = lTotal ' Already whole number
+        wsIn.Cells(i, "G").Value = finalCat
+        
+        runningTotal = runningTotal + lTotal
+    Next i
+
+    '--- 4. GRAND TOTAL VALIDATION ---
+    ' Compare rounded sums
+    If Abs(runningTotal - controlTotal) > 0.1 Then
+        wsIn.Range(ADDR_CONTROL_TOTAL).Interior.Color = vbRed
+        MsgBox "TOTAL AMOUNT MISMATCH!" & vbCrLf & _
+               "Control Total (Rounded): " & Format(controlTotal, "#,##0") & vbCrLf & _
+               "Calculated Lines (Rounded): " & Format(runningTotal, "#,##0"), vbCritical
+        GoTo CleanExit
+    End If
+
+    '--- 5. EXPORT TO 17-COLUMN TEMPLATE ---
+    Set wbNew = Workbooks.Add: Set wsOut = wbNew.Sheets(1)
+    Dim headers As Variant
+    headers = Array("Header Text", "Vendor Code", "Vendor Name", "Invoice Date", "Text", "Assignment", "Currency", "VAT", "NET", "TOTAL", "Category", "PO", "Profit Center", "Cost Center", "Material", "GR Doc #", "SAP Document #")
+    wsOut.Range("A1:Q1").Value = headers
+
+    targetRow = 2
+    For i = DATA_START_ROW To lastRow
+        ' Mapping Header (SuperTrim applied)
+        wsOut.Cells(targetRow, 1).Value = SuperTrim(wsIn.Range(ADDR_HDR_TEXT).Value)
+        wsOut.Cells(targetRow, 2).Value = SuperTrim(wsIn.Range(ADDR_VND_CODE).Value)
+        wsOut.Cells(targetRow, 3).Value = SuperTrim(wsIn.Range(ADDR_VND_NAME).Value)
+        wsOut.Cells(targetRow, 4).Value = SuperTrim(wsIn.Range(ADDR_INV_DATE).Value)
+        wsOut.Cells(targetRow, 5).Value = SuperTrim(wsIn.Range(ADDR_TEXT).Value)
+        wsOut.Cells(targetRow, 6).Value = SuperTrim(wsIn.Range(ADDR_ASSIGN).Value)
+        wsOut.Cells(targetRow, 7).Value = SuperTrim(wsIn.Range(ADDR_CURR).Value)
+        
+        ' Mapping Line Item (Whole Numbers)
+        wsOut.Cells(targetRow, 8).Value = wsIn.Cells(i, "H").Value
+        wsOut.Cells(targetRow, 9).Value = wsIn.Cells(i, "I").Value
+        wsOut.Cells(targetRow, 10).Value = wsIn.Cells(i, "J").Value
+        wsOut.Cells(targetRow, 11).Value = wsIn.Cells(i, "G").Value
+        
+        rawInput = SuperTrim(CStr(wsIn.Cells(i, "K").Value))
+        If wsIn.Cells(i, "G").Value = "PO" Then wsOut.Cells(targetRow, 12).Value = rawInput
+        If Left(rawInput, 1) = "P" And Len(rawInput) = 5 Then wsOut.Cells(targetRow, 13).Value = rawInput
+        If Len(rawInput) = 7 Then wsOut.Cells(targetRow, 14).Value = rawInput
+        wsOut.Cells(targetRow, 15).Value = SuperTrim(wsIn.Cells(i, "N").Value)
+        
+        targetRow = targetRow + 1
+    Next i
+
+    '--- 6. TEMPLATE FORMATTING ---
+    With wsOut.Cells
+        .NumberFormat = "@": .Font.Name = "Arial": .Font.Size = 10
+        .VerticalAlignment = xlCenter: .HorizontalAlignment = xlLeft
+    End With
+    ' Comma separator with No Decimals
+    wsOut.Columns("H:J").NumberFormat = "#,##0"
+    wsOut.Range("A1:Q1").Font.Bold = True
+    wsOut.Columns.AutoFit
+
+    '--- 7. SAVING ---
+    finalFileName = CleanFileName(docType & "_" & Trim(wsIn.Range(ADDR_VND_CODE).Value) & "_" & Trim(wsIn.Range(ADDR_TEXT).Value))
+    finalSavePath = SuperTrim(wsIn.Range(ADDR_SAVE_PATH).Value)
+    
+    If finalSavePath = "" Then finalSavePath = ThisWorkbook.Path & "\"
+    If Right(finalSavePath, 1) <> "\" Then finalSavePath = finalSavePath & "\"
+    
+    On Error Resume Next
+    wbNew.SaveAs fileName:=finalSavePath & finalFileName & ".xlsx", FileFormat:=51
+    If Err.Number = 0 Then
+        MsgBox "Success! Saved as: " & finalFileName, vbInformation
+    Else
+        MsgBox "SAVE FAILED!", vbCritical
+    End If
+    On Error GoTo 0
+
+CleanExit:
+    Application.ScreenUpdating = True
+End Sub
+
+' ############################################################
+' HELPER FUNCTIONS
+' ############################################################
+
+Function SuperTrim(ByVal txt As String) As String
+    ' Removes EVERY piece of white space (internal, tabs, newlines)
+    Dim i As Integer: Dim result As String: result = txt
+    Dim whiteSpace As Variant
+    whiteSpace = Array(Chr(32), Chr(160), vbTab, vbCr, vbLf)
+    For i = LBound(whiteSpace) To UBound(whiteSpace)
+        result = Replace(result, whiteSpace(i), "")
+    Next i
+    SuperTrim = result
+End Function
+
+Function HasDigit(ByVal txt As String) As Boolean
+    HasDigit = (txt Like "*[0-9]*")
+End Function
+
+Function CleanFileName(ByVal txt As String) As String
+    Dim illegalChars As Variant, i As Long: illegalChars = Array("/", "\", ":", "*", "?", """", "<", ">", "|")
+    CleanFileName = txt
+    For i = LBound(illegalChars) To UBound(illegalChars)
+        CleanFileName = Replace(CleanFileName, illegalChars(i), "_")
+    Next i
+End Function
