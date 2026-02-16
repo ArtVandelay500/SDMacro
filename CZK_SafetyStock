@@ -1,0 +1,197 @@
+Sub Update_All_SCM_Final_System_v3()
+    Dim sess As Object
+    Dim wsAll As Worksheet
+    Dim lastRow As Long, i As Long, tRows As Long
+    Dim matNo As String, sloc As String, key As String, currentDT As String
+    Dim rawVal As Variant, qty As Double
+    
+    currentDT = Format(Now, "yyyy-mm-dd HH:mm")
+    
+    ' Dictionary 선언
+    Dim dictStock As Object: Set dictStock = CreateObject("Scripting.Dictionary")
+    Dim dictInbound As Object: Set dictInbound = CreateObject("Scripting.Dictionary")
+    Dim dictOutbound As Object: Set dictOutbound = CreateObject("Scripting.Dictionary")
+    
+    Set wsAll = ThisWorkbook.Worksheets("all")
+    lastRow = wsAll.Cells(wsAll.Rows.Count, "A").End(xlUp).row
+    If lastRow < 2 Then Exit Sub
+
+   ' --- [STEP 1: MB52 현재고 - 창고별 구분 유지] ---
+    Set sess = SapGetSessionByTCode("", "", "MB52", True, True, True)
+    If Not sess Is Nothing Then
+        ' A. 자재 번호 붙여넣기
+        wsAll.Range("A2:A" & lastRow).Copy
+        sess.findById("wnd[0]/usr/btn%_MATNR_%_APP_%-VALU_PUSH").press
+        sess.findById("wnd[1]/tbar[0]/btn[24]").press
+        sess.findById("wnd[1]/tbar[0]/btn[8]").press
+        
+        ' B. 고유 창고번호 추출 (Rally Point 로직)
+        Dim uSlocs As Object: Set uSlocs = CreateObject("Scripting.Dictionary")
+        Dim slocList As String: slocList = ""
+        For i = 2 To lastRow
+            sloc = Trim(CStr(wsAll.Cells(i, "C").value))
+            If sloc <> "" And Not uSlocs.Exists(sloc) Then
+                uSlocs(sloc) = 0
+                slocList = slocList & sloc & vbCrLf
+            End If
+        Next i
+        
+        ' C. 클립보드 이용하여 고유 창고 붙여넣기
+        Dim dataObj As Object
+        Set dataObj = CreateObject("New:{1C3B4210-F441-11CE-B9EA-00AA006B1A69}")
+        dataObj.SetText slocList
+        dataObj.PutInClipboard
+        
+        sess.findById("wnd[0]/usr/btn%_LGORT_%_APP_%-VALU_PUSH").press
+        sess.findById("wnd[1]/tbar[0]/btn[24]").press
+        sess.findById("wnd[1]/tbar[0]/btn[8]").press
+        sess.findById("wnd[0]/tbar[1]/btn[8]").press ' 실행
+        
+        SapWaitIdle sess
+        With sess.findById("wnd[0]/usr/cntlGRID1/shellcont/shell")
+            ' 누락 방지 전체 로딩
+            tRows = .RowCount
+            If tRows > 0 Then: .firstVisibleRow = tRows - 1: .firstVisibleRow = 0
+            
+            For i = 0 To tRows - 1
+                matNo = Trim(CStr(.getCellValue(i, "MATNR")))
+                sloc = Trim(CStr(.getCellValue(i, "LGORT")))
+                key = matNo & "_" & sloc ' 자재_창고 키 유지
+                rawVal = .getCellValue(i, "LABST")
+                qty = CDbl(Replace(IIf(rawVal = "", "0", rawVal), ",", ""))
+                
+                ' 수량이 0보다 큰 경우만 저장
+                If qty > 0 Then dictStock(key) = dictStock(key) + qty
+            Next i
+        End With
+    End If
+
+    ' --- [STEP 2: ME2L 입고예정] ---
+    ' (기존 로직과 동일하되 tRows 강제 로딩 포함)
+    Set sess = SapGetSessionByTCode("", "", "ME2L", True, True, True)
+    If Not sess Is Nothing Then
+        wsAll.Range("A2:A" & lastRow).Copy
+        With sess
+            .findById("wnd[0]/usr/ctxtEL_EKORG-LOW").Text = "5952"
+            .findById("wnd[0]/usr/ctxtSELPA-LOW").Text = "WE101"
+            .findById("wnd[0]/usr/ctxtS_WERKS-LOW").Text = "5952"
+            .findById("wnd[0]/usr/ctxtLISTU").Text = "YBESTALV"
+            .findById("wnd[0]/usr/btn%_S_MATNR_%_APP_%-VALU_PUSH").press
+            .findById("wnd[1]/tbar[0]/btn[24]").press
+            .findById("wnd[1]/tbar[0]/btn[8]").press
+            .findById("wnd[0]/tbar[1]/btn[8]").press
+        End With
+        SapWaitIdle sess
+        With sess.findById("wnd[0]/usr/cntlGRID1/shellcont/shell")
+            tRows = .RowCount
+            If tRows > 0 Then: .firstVisibleRow = tRows - 1: .firstVisibleRow = 0
+            For i = 0 To tRows - 1
+                matNo = Trim(CStr(.getCellValue(i, "EMATN")))
+                rawVal = .getCellValue(i, "MGLIEF")
+                dictInbound(matNo) = dictInbound(matNo) + CDbl(Replace(IIf(rawVal = "", "0", rawVal), ",", ""))
+            Next i
+        End With
+    End If
+' --- [STEP 3: VA05 출고예정 - 드릴다운 팝업 행 선택 및 확인] ---
+Set sess = SapGetSessionByTCode("", "", "VA05", True, True, True)
+If Not sess Is Nothing Then
+    ' 1. 기본 조회 실행
+    wsAll.Range("A2:A" & lastRow).Copy
+    With sess
+        .findById("wnd[0]/usr/ctxtSAUART-LOW").Text = "z5ta"
+        .findById("wnd[0]/usr/radPVBOFF").Select
+        .findById("wnd[0]/usr/btn%_SMATNR_%_APP_%-VALU_PUSH").press
+        .findById("wnd[1]/tbar[0]/btn[24]").press ' 붙여넣기
+        .findById("wnd[1]/tbar[0]/btn[8]").press  ' 확인
+        .findById("wnd[0]/tbar[1]/btn[8]").press  ' 실행
+    End With
+    SapWaitIdle sess
+    
+    ' 2. Total & Subtotal 실행
+    With sess.findById("wnd[0]/usr/cntlGRID1/shellcont/shell")
+        .selectColumn "KWMENG"
+        sess.findById("wnd[0]/tbar[1]/btn[30]").press ' Total
+        .selectColumn "MATNR"
+        sess.findById("wnd[0]/tbar[1]/btn[42]").press ' Subtotal
+    End With
+    
+    ' 3. 드릴다운 메뉴 호출 및 [핵심] 팝업창 내 행 선택 (현욱 님 코드)
+    sess.findById("wnd[0]/mbar/menu[3]/menu[2]").Select ' 드릴다운 클릭
+    SapWaitIdle sess
+    
+    ' [여기가 포인트!] 팝업창(wnd[1]) 내의 그리드에서 1번 행을 선택
+    With sess.findById("wnd[1]/usr/cntlGRID/shellcont/shell")
+        .currentCellRow = 1
+        .selectedRows = "1" ' 현욱 님이 찾으신 1번 행 선택
+    End With
+    
+    ' 팝업창 툴바의 확인 버튼 클릭
+    sess.findById("wnd[1]/tbar[0]/btn[0]").press
+    SapWaitIdle sess
+    
+    ' 만약 추가 확인창(wnd[2])이 뜬다면 처리 (기존 스크립트 반영)
+    On Error Resume Next
+    sess.findById("wnd[2]/tbar[0]/btn[0]").press
+    On Error GoTo 0
+    
+    ' 4. 이제 최종적으로 바뀐 메인 화면 그리드에서 데이터 추출
+    Dim gridFinal As Object
+    Set gridFinal = sess.findById("wnd[0]/usr/cntlGRID1/shellcont/shell")
+    
+    ' 행 개수 파악 (전환된 화면 기준)
+    tRows = gridFinal.RowCount
+    
+    For i = 0 To tRows - 1
+        matNo = Trim(CStr(gridFinal.getCellValue(i, "MATNR")))
+        rawVal = gridFinal.getCellValue(i, "KWMENG")
+        
+        If matNo <> "" And InStr(matNo, "Total") = 0 Then
+            dictOutbound(matNo) = CDbl(Replace(IIf(rawVal = "", "0", rawVal), ",", ""))
+        End If
+    Next i
+End If
+    ' --- [STEP 4: 최종 매핑] ---
+    wsAll.Cells(1, "D").value = "현재고 (" & currentDT & ")"
+    wsAll.Cells(1, "E").value = "입고예정 (" & currentDT & ")"
+    wsAll.Cells(1, "F").value = "출고예정 (" & currentDT & ")"
+    
+    For i = 2 To lastRow
+        matNo = Trim(CStr(wsAll.Cells(i, "A").value))
+        sloc = Trim(CStr(wsAll.Cells(i, "C").value))
+        key = matNo & "_" & sloc
+        wsAll.Cells(i, "D").value = IIf(dictStock.Exists(key), dictStock(key), 0)
+        wsAll.Cells(i, "E").value = IIf(dictInbound.Exists(matNo), dictInbound(matNo), 0)
+        wsAll.Cells(i, "F").value = IIf(dictOutbound.Exists(matNo), dictOutbound(matNo), 0)
+    Next i
+    
+    ' --- [STEP 5: 시트 복사 및 날짜별 저장] ---
+    Dim newSheetName As String
+    Dim wsNew As Worksheet
+    
+    ' 1. 새 시트 이름 생성 (예: 2026-02-16)
+    newSheetName = Format(Now, "yyyy-mm-dd")
+    
+    ' 2. 동일한 이름의 시트가 있는지 확인 후 삭제 (중복 실행 대비)
+    On Error Resume Next
+    Application.DisplayAlerts = False
+    Sheets(newSheetName).Delete
+    Application.DisplayAlerts = True
+    On Error GoTo 0
+    
+    ' 3. 'all' 시트를 복사하여 맨 뒤에 배치
+    wsAll.Copy After:=Sheets(Sheets.Count)
+    Set wsNew = Sheets(Sheets.Count)
+    
+    ' 4. 시트 이름 변경 및 수식을 값으로 변경 (데이터 보존)
+    On Error Resume Next
+    wsNew.Name = newSheetName
+    
+    ' 수식이 포함되어 있다면 나중에 값이 변할 수 있으므로 '값'으로 고정
+    wsNew.UsedRange.value = wsNew.UsedRange.value
+    On Error GoTo 0
+
+    ' 5. 다시 'all' 시트로 돌아와서 마무리
+    wsAll.Activate
+    
+    MsgBox "현욱 님, 모든 데이터 업데이트 및 [" & newSheetName & "] 시트 생성이 완료되었습니다!", vbInformation
+End Sub
