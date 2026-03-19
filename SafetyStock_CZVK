@@ -1,0 +1,154 @@
+Sub Update_P32_SafetyStock_Final_Integrated()
+    Dim sess As Object
+    Dim wsAll As Worksheet
+    Dim lastRow As Long, i As Long, tRows As Long
+    Dim matNo As String, sloc As String, key As String, currentDT As String
+    Dim rawVal As Variant, currentStock As Double, inboundPlan As Double
+    Dim maxStock As Double, orderQty As Double
+    
+    currentDT = Format(Now, "yyyy-mm-dd HH:mm")
+    
+    ' Dictionary 준비 (현재고 및 입고예정용)
+    Dim dictStock As Object: Set dictStock = CreateObject("Scripting.Dictionary")
+    Dim dictInbound As Object: Set dictInbound = CreateObject("Scripting.Dictionary")
+    
+    Set wsAll = ThisWorkbook.Worksheets("all")
+    lastRow = wsAll.Cells(wsAll.Rows.Count, "A").End(xlUp).Row
+    If lastRow < 2 Then Exit Sub
+
+    ' --- [STEP 1: MB52 현재고 - Plant 5950 기준] ---
+    Set sess = SapGetSessionByTCode("", "", "MB52", True, True, True)
+    If Not sess Is Nothing Then
+        wsAll.Range("A2:A" & lastRow).Copy
+        With sess
+            .findById("wnd[0]/usr/ctxtWERKS-LOW").Text = "5950" ' 플랜트 고정
+            .findById("wnd[0]/usr/btn%_MATNR_%_APP_%-VALU_PUSH").press
+            .findById("wnd[1]/tbar[0]/btn[24]").press
+            .findById("wnd[1]/tbar[0]/btn[8]").press
+            
+            ' 고유 창고번호 추출 및 입력
+            Dim uSlocs As Object: Set uSlocs = CreateObject("Scripting.Dictionary")
+            Dim slocList As String: slocList = ""
+            For i = 2 To lastRow
+                sloc = Trim(CStr(wsAll.Cells(i, "C").Value))
+                If sloc <> "" And Not uSlocs.Exists(sloc) Then
+                    uSlocs(sloc) = 0
+                    slocList = slocList & sloc & vbCrLf
+                End If
+            Next i
+            
+            Dim dataObj As Object
+            Set dataObj = CreateObject("New:{1C3B4210-F441-11CE-B9EA-00AA006B1A69}")
+            dataObj.SetText slocList
+            dataObj.PutInClipboard
+            
+            .findById("wnd[0]/usr/btn%_LGORT_%_APP_%-VALU_PUSH").press
+            .findById("wnd[1]/tbar[0]/btn[24]").press
+            .findById("wnd[1]/tbar[0]/btn[8]").press
+            .findById("wnd[0]/tbar[1]/btn[8]").press ' 실행
+        End With
+        
+        SapWaitIdle sess
+        Dim gridMB52 As Object
+        On Error Resume Next
+        Set gridMB52 = sess.findById("wnd[0]/usr/cntlGRID1/shellcont/shell")
+        If gridMB52 Is Nothing Then Set gridMB52 = sess.findById("wnd[0]/usr/cntlGRID0100/shellcont/shell")
+        On Error GoTo 0
+        
+        If Not gridMB52 Is Nothing Then
+            tRows = gridMB52.RowCount
+            If tRows > 0 Then: gridMB52.firstVisibleRow = tRows - 1: gridMB52.firstVisibleRow = 0
+            For i = 0 To tRows - 1
+                matNo = Trim(CStr(gridMB52.getCellValue(i, "MATNR")))
+                sloc = Trim(CStr(gridMB52.getCellValue(i, "LGORT")))
+                key = matNo & "_" & sloc
+                rawVal = gridMB52.getCellValue(i, "LABST")
+                currentStock = CDbl(Replace(IIf(rawVal = "", "0", rawVal), ",", ""))
+                If currentStock > 0 Then dictStock(key) = dictStock(key) + currentStock
+            Next i
+        End If
+    End If
+
+    ' --- [STEP 2: ME2L 입고예정 - No Data Found 대응] ---
+    Set sess = SapGetSessionByTCode("", "", "ME2L", True, True, True)
+    If Not sess Is Nothing Then
+        wsAll.Range("A2:A" & lastRow).Copy
+        With sess
+            .findById("wnd[0]/usr/ctxtEL_EKORG-LOW").Text = "5950"
+            .findById("wnd[0]/usr/ctxtSELPA-LOW").Text = "WE101"
+            .findById("wnd[0]/usr/ctxtLISTU").Text = "BEST_ALV"
+            .findById("wnd[0]/usr/btn%_S_MATNR_%_APP_%-VALU_PUSH").press
+            .findById("wnd[1]/tbar[0]/btn[24]").press
+            .findById("wnd[1]/tbar[0]/btn[8]").press
+            .findById("wnd[0]/tbar[1]/btn[8]").press
+        End With
+        SapWaitIdle sess
+        
+        If InStr(sess.findById("wnd[0]/sbar").Text, "No suitable") > 0 Then
+            ' 데이터 없음: dictInbound는 비어있음 (0으로 처리됨)
+        Else
+            On Error Resume Next
+            Dim gridME2L As Object
+            Set gridME2L = sess.findById("wnd[0]/usr/cntlGRID1/shellcont/shell")
+            If gridME2L Is Nothing Then Set gridME2L = sess.findById("wnd[0]/usr/cntlGRID0100/shellcont/shell")
+            
+            If Not gridME2L Is Nothing Then
+                tRows = gridME2L.RowCount
+                If tRows > 0 Then: gridME2L.firstVisibleRow = tRows - 1: gridME2L.firstVisibleRow = 0
+                For i = 0 To tRows - 1
+                    matNo = Trim(CStr(gridME2L.getCellValue(i, "EMATN")))
+                    rawVal = gridME2L.getCellValue(i, "MGLIEF")
+                    dictInbound(matNo) = dictInbound(matNo) + CDbl(Replace(IIf(rawVal = "", "0", rawVal), ",", ""))
+                Next i
+            End If
+            On Error GoTo 0
+        End If
+    End If
+
+    ' --- [STEP 3: 최종 매핑 및 발주 제안 계산] ---
+    wsAll.Cells(1, "D").Value = "현재고 (" & currentDT & ")"
+    wsAll.Cells(1, "E").Value = "입고예정 (" & currentDT & ")"
+    wsAll.Cells(1, "F").Value = "발주 필요 수량 (" & currentDT & ")"
+    
+    ' F열 초기화 (기존 색상 제거)
+    wsAll.Columns("F").Interior.ColorIndex = xlNone
+
+    For i = 2 To lastRow
+        matNo = Trim(CStr(wsAll.Cells(i, "A").Value))
+        sloc = Trim(CStr(wsAll.Cells(i, "C").Value))
+        key = matNo & "_" & sloc
+        
+        currentStock = IIf(dictStock.Exists(key), dictStock(key), 0)
+        inboundPlan = IIf(dictInbound.Exists(matNo), dictInbound(matNo), 0)
+        maxStock = CDbl(IIf(wsAll.Cells(i, "B").Value = "", 0, wsAll.Cells(i, "B").Value))
+        
+        wsAll.Cells(i, "D").Value = currentStock
+        wsAll.Cells(i, "E").Value = inboundPlan
+        
+        ' 발주량 계산: Max - (현재고 + 입고예정)
+        orderQty = maxStock - (currentStock + inboundPlan)
+        
+        If orderQty > 0 Then
+            wsAll.Cells(i, "F").Value = orderQty
+            wsAll.Cells(i, "F").Interior.ColorIndex = 6 ' 노란색 강조
+        Else
+            wsAll.Cells(i, "F").Value = 0
+        End If
+    Next i
+
+    ' --- [STEP 4: 시트 스냅샷 백업] ---
+    Dim newSheetName As String: newSheetName = "P32_" & Format(Now, "yyyy-mm-dd")
+    On Error Resume Next
+    Application.DisplayAlerts = False
+    Sheets(newSheetName).Delete
+    Application.DisplayAlerts = True
+    wsAll.Copy After:=Sheets(Sheets.Count)
+    With Sheets(Sheets.Count)
+        .Name = newSheetName
+        .UsedRange.Value = .UsedRange.Value
+    End With
+    On Error GoTo 0
+    
+    wsAll.Activate
+    MsgBox "현욱 님, P32 발주 권고 데이터 작성이 완료되었습니다!", vbInformation
+End Sub
